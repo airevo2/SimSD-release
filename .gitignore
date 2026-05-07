@@ -1,0 +1,80 @@
+# IDE / Editor
+.cursor/
+.claude/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.plot_env/
+
+# Model weights (download from HF)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+
+# Tokenizer / vocab (large, downloadable)
+tokenizer.json
+vocab.json
+merges.txt
+*.tiktoken
+
+# Model directories (download from HF)
+inference/model/
+
+# Caches
+.cache/
+hf_cache/
+ms_cache/
+
+# Env
+.env
+.env.*
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+
+# Logs / experiment outputs
+*.log
+wandb/
+swanlog/
+speculative_decoding/results/
+speculative_decoding/quality/
+speculative_decoding/throughput/
+speculative_decoding/test/
+speculative_decoding/Experiment_Backend/results/
+outputs/
+
+# Plots / artifacts
+*.png
+*.svg
+*.pdf
+
+# Datasets / rollouts
+data/
+*.jsonl

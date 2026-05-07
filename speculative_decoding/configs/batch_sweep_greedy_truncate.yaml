@@ -1,0 +1,35 @@
+# Single-GPU batch sweep for TPS  apples-to-apples vs native at same GPU count.
+# Both native and spec run on cuda:0; spec keeps draft + target colocated
+# (no pipeline since pipelined batch is not implemented in speculative_decode.py).
+# Vary --batch from CLI.
+
+draft_model: inference/model/SDAR-1_7B-Chat
+target_model: inference/model/SDAR-8B-Chat
+draft_device: "cuda:0"
+target_device: "cuda:0"
+dtype: bfloat16
+mask_token_id: 151669
+
+block_length: 4
+denoising_steps: 4
+num_blocks: 32
+K: 1
+
+speculative_branch: greedy_match
+# NOTE: truncate is NOT batch-compatible  speculative_generate_batch's
+# draft_one_block_batch asserts uniform ctx_len, but truncate produces
+# variable-length commits. Use draft_argmax (legacy default, fixed-length
+# commit via draft.argmax pad) for the batch sweep. This has the SAME
+# forward count as truncate so TPS profile is equivalent; only quality
+# differs (per 09 §2 truncate > draft_argmax). For TPS measurement, fine.
+partial_block_fill: draft_argmax
+draft_sampling: multinomial
+target_eval_sdpa: true
+
+num_samples: 40
+dataset: gsm8k
+dataset_split: test
+seed: 42
+
+# Tag used for output file naming (will be appended with batch / dataset suffix).
+tag: batch_sweep_greedy_truncate

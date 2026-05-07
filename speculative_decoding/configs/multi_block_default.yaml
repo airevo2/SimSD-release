@@ -1,0 +1,15 @@
+# Multi-block speculative decoding (full generation).
+# Draft generates blocks sequentially, target verifies each via causal mask.
+
+mode: multi_block
+block_length: 4
+denoising_steps: 4
+num_blocks: 1
+num_samples: 100
+dataset: gsm8k
+dataset_split: train
+draft_device: "cuda:1"
+target_device: "cuda:1"
+seed: 42
+log_interval: 10
+tag: multi_block_bl4_ds4_nb8

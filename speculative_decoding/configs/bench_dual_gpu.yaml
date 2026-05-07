@@ -1,0 +1,22 @@
+# Draft (4B) on cuda:0, Target (8B) on cuda:1
+#  dllm_causal_train :
+#   python speculative_decoding/bench/run_benchmark.py \
+#     --config speculative_decoding/configs/bench_dual_gpu.yaml \
+#     --compare both --no_eos_stop
+
+draft_model: inference/model/SDAR-4B-Chat
+target_model: inference/model/SDAR-8B-Chat
+draft_device: "cuda:0"
+target_device: "cuda:1"
+dtype: bfloat16
+mask_token_id: 151669
+
+block_length: 4
+denoising_steps: 4
+num_blocks: 4
+num_samples: 20
+dataset: gsm8k
+dataset_split: train
+seed: 42
+
+tag: bench_dual_gpu_nb4_bl4_ds4

@@ -1,0 +1,25 @@
+#  block Speculative (4B+8B+MRS) vs  8Bdraft_one_block
+#  dllm_causal_train  torch/transformers/datasets:
+#   python speculative_decoding/bench/run_benchmark.py \
+#     --config speculative_decoding/configs/bench_fixed_blocks.yaml \
+#     --no_eos_stop
+# --no_eos_stop:  EOS  num_blocks
+
+draft_model: inference/model/SDAR-4B-Chat
+target_model: inference/model/SDAR-8B-Chat
+draft_device: "cuda:1"
+target_device: "cuda:1"
+dtype: bfloat16
+mask_token_id: 151669
+
+block_length: 4
+denoising_steps: 4
+block_causal_prompt: true  # true=SDAR block-level causal; false=legacy prompt sees mask
+num_blocks: 4
+num_samples: 20
+dataset: gsm8k
+dataset_split: train
+seed: 42
+
+# tag  bench_latency_{tag}.json
+tag: bench_fixed_nb4_bl4_ds4

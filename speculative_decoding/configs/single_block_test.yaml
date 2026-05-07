@@ -1,0 +1,22 @@
+# Single-block speculative decoding test.
+# Draft generates 1 block, target verifies, MRS accept/reject.
+# For alignment testing and ablation studies.
+
+mode: single_block
+block_length: 4
+denoising_steps: 4
+num_blocks: 1
+num_samples: 20
+dataset: gsm8k
+dataset_split: test
+draft_device: "cuda:1"
+target_device: "cuda:1"
+seed: 42
+log_interval: 10
+ascii_demo: true  # set true to print ASCII process on first sample
+tag: single_block_bl4_ds4
+
+#  mrs + position:
+# speculative_branch: per_position_compare   #  MRS position  per_position
+# mrs_verify_order: step_map                 # ⚠  bug mrs.py docstring / quality SUMMARY
+# per_position_breakdown: true                # mrs  jsonl  per_position
