@@ -1,0 +1,10 @@
+torch==2.8.0
+transformers==4.52.4
+datasets==4.8.5
+huggingface_hub>=0.30.0,<1.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+sentencepiece
+tiktoken
+tqdm
+flash-attn==2.8.3

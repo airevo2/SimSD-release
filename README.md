@@ -1,119 +1,86 @@
-# Speculative Decoding for SDAR Block Diffusion
+# SimSD — Speculative Decoding for SDAR Block Diffusion
 
-Speculative decoding implementation for SDAR (Synergy of Diffusion and AutoRegression) models.
-Combines a small draft model (block diffusion denoising) with a larger target model (multi-block
-causal verification + Modified Rejection Sampling) to accelerate generation.
+Speculative decoding for SDAR (Synergy of Diffusion and AutoRegression)
+models. A small draft model (SDAR-1.7B-Chat) runs block-diffusion denoising;
+a larger target model (SDAR-8B-Chat) verifies via multi-block causal attention
+in a single forward pass, with greedy-match acceptance + variable-length
+truncate commit. The default pipeline runs draft on one GPU and target on
+another with full stream overlap (incl. speculative target K/V extend).
 
-## Layout
+Compared to the TP=2 vanilla baseline at ~9.6 tok/s, the optimized `ours` config
+reaches **63–74 tok/s** on a single 96 GB Blackwell pair, lossless w.r.t.
+argmax-decoded target (token-by-token identical output).
 
-The repo is grouped into three top-level entry-point folders plus the core SD library:
+---
 
-```
-.
-├── sdar/                            # Shared SDAR support (used by everything)
-│   ├── modeling_sdar.py             #   vendored HF SDAR modeling code
-│   ├── new_attn.py                  #   single-block causal mask helper
-│   ├── new_attn_multi_block.py      #   multi-block causal mask construction
-│   └── run_native_tp2.py            #   patch_stock_rms_norm + TP=2 native runner
-│
-├── main_table/                      # Main-table runners (Vanilla, Vanilla+CG, SimSD)
-│   ├── run_vanilla_tp2_cache.py     #   Vanilla baseline (TP=2, multinomial)
-│   ├── run_native_tp2_cache.py      #   Vanilla + CUDA-Graph baseline (TP=2)
-│   └── quality_compare.py           #   quality eval driver
-│                                    #   (SimSD speed: speculative_decoding/bench/run_benchmark.py)
-│                                    #   (SimSD entry: speculative_decoding/speculative_decode.py)
-│
-├── ablation/                        # Ablation studies (no duplicates)
-│   ├── draft_probs_ablation_v1_5*.py    # v1.5 (base / batch / fused / graph) ablations
-│   ├── draft_probs_ablation_v2.py       # v2: exact 4D-mask rules on draft side
-│   ├── draft_probs_ablation_v3.py       # v3: single-replace per-block probs
-│   ├── verify_layout_ablation.py        # verify-layout ablation
-│   ├── microbench_graph_vs_eager.py     # cuda-graph vs eager micro-bench
-│   ├── bench/                            # per-ablation latency runners (bench_v1_5*.py)
-│   └── sweep/                            # sweep drivers + common util
-│
-└── speculative_decoding/            # Core SimSD library (entry point + internals)
-    ├── speculative_decode.py        #   Entry point: draft → verify → MRS loop
-    ├── draft.py                     #   draft_one_block(): block diffusion denoising
-    ├── verify.py                    #   multi-block causal mask + target verify
-    ├── mrs.py                       #   Modified Rejection Sampling
-    ├── cache_aware.py               #   KV-cache pipelined SD path
-    ├── config.py                    #   SpecConfig + YAML loader
-    ├── configs/                     #   YAML experiment configs
-    ├── bench/                       #   SimSD latency benchmark harness (used by main_table)
-    └── Experiment_Backend/          #   Shared quality library (self_draft_compare)
-```
+## 1. Install
 
-### Why these three top-level groups
+Tested on Python 3.10, CUDA 12.8 (NVIDIA RTX PRO 6000 Blackwell). The repo has
+no Python package of its own — it is run from the source tree.
 
-- **`sdar/`** — every runner (vanilla, vanilla+CG, SimSD, every ablation) imports the
-  same SDAR modeling code, the same attention-mask helpers, and `patch_stock_rms_norm`.
-  Pulling them into one folder makes the shared dependency explicit.
-- **`main_table/`** — the scripts that produce the main-table numbers (speed + quality)
-  for Vanilla, Vanilla+CG, and SimSD.
-- **`ablation/`** — every ablation variant lives here so the main table is not mixed
-  with research experiments. Each ablation pairs a monkey-patch script with its
-  matching `bench/bench_v1_5_*.py` runner.
-
-The legacy `draft_probs_ablation.py` (v1, superseded by v1.5) has been removed.
-
-## Setup
-
-1. Install Python dependencies (PyTorch, transformers, datasets, etc.):
-   ```bash
-   pip install -r speculative_decoding/requirements_speculative.txt
-   ```
-2. Download SDAR checkpoints from HuggingFace (or point `--target_model` /
-   `--draft_model` to your local path) and place them under
-   `inference/model/SDAR-{1.7B,4B,8B}-Chat/` (or pass paths directly). The
-   vendored `sdar/modeling_sdar.py` matches the 8B-Chat / `-bN` variants; if
-   you instead load 1.7B/4B without `-bN` suffix, HuggingFace's
-   `trust_remote_code=True` will pull the corresponding modeling file from
-   the checkpoint directory.
-
-## Quick start
-
-SimSD speculative decoding (alignment test on a single block):
 ```bash
-python speculative_decoding/speculative_decode.py \
-  --config speculative_decoding/configs/single_block_test.yaml
+# 1) Create env (conda or venv). Match the python / cuda versions if you can.
+conda create -n simsd python=3.10 -y && conda activate simsd
+
+# 2) Install PyTorch matching your CUDA toolkit (cu128 example below):
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+
+# 3) The rest of the deps:
+pip install -r requirements.txt
 ```
 
-SimSD latency benchmark (native vs speculative):
+`flash-attn` is required by the vendored SDAR modeling code (top-level
+`from flash_attn.ops.triton.layer_norm import rms_norm_fn`). If the prebuilt
+wheel does not match your torch/CUDA, build it from source:
+
 ```bash
-python speculative_decoding/bench/run_benchmark.py \
-  --config speculative_decoding/configs/bench_fixed_blocks.yaml \
-  --compare both --no_eos_stop
+pip install flash-attn==2.8.3 --no-build-isolation
 ```
 
-Vanilla + CG baseline (TP=2 native, KV cache + cuda_graph):
+### Model weights
+
+Download from HuggingFace (or point `--draft_model` / `--target_model` to your
+local copies):
+
+- `JetLM/SDAR-1.7B-Chat` (draft)
+- `JetLM/SDAR-8B-Chat`   (target)
+
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29560 \
-  main_table/run_native_tp2_cache.py \
-  --target_model <hf-id-or-path-to-SDAR-target> \
-  --output_dir runs/native_tp2 \
-  --use_cuda_graph
+huggingface-cli download JetLM/SDAR-1.7B-Chat
+huggingface-cli download JetLM/SDAR-8B-Chat
 ```
 
-Vanilla baseline (TP=2 multinomial, no cuda_graph):
+---
+
+## 2. One-click reproduce main_table
+
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29560 \
-  main_table/run_vanilla_tp2_cache.py \
-  --target_model <hf-id-or-path-to-SDAR-target> \
-  --output_dir runs/vanilla_tp2
+python main.py
 ```
 
-Quality comparison:
-```bash
-python main_table/quality_compare.py --help
-```
+That single command runs all three methods (`vanilla` / `vanilla_cg` / `ours`)
+× {`latency`, `quality`} over four datasets (`gsm8k`, `mbpp`, `triviaqa`,
+`mmlu`) at N=200, writes per-job `SUMMARY.json` plus a top-level
+`UNIFIED.json`, and prints a unified results table at the end. Defaults
+already point at the HuggingFace checkpoints
+(`JetLM/SDAR-8B-Chat` + `JetLM/SDAR-1.7B-Chat`), GPUs `0,1`, and the
+optimized `ours` config (fused denoise + speculative target extend +
+truncate + greedy-match). Throughput is computed from `torch.cuda.Event`
+(not wall clock).
+
+---
 
 ## Notes
 
-- Model weights, datasets, and run outputs are intentionally not part of this repo
+- Model weights, datasets and run outputs are not part of this repo
   (see `.gitignore`). Download them separately.
 - The IFEval scorer in `speculative_decoding/Experiment_Backend/self_draft_compare.py`
   requires OpenCompass on `sys.path`. Set `OPENCOMPASS_PATH=/path/to/opencompass`
   before running if you want IFEval scoring; otherwise the loader is a no-op.
-- Conda activation is opt-in via `CONDA_SH` / `CONDA_ENV` environment variables
-  (see `ablation/sweep/run_self_draft.sh`).
+- `vanilla` / `vanilla_cg` runners use `torchrun --nproc_per_node=2`. `ours`
+  is single-process dual-GPU (draft on `cuda:0`, target on `cuda:1`). The 4 GPU
+  IDs you give via `--gpus` are split: first pair for vanilla/vanilla_cg, the
+  same pair re-used (one process at a time) for ours.
+- vanilla_cg can hang on `dist.destroy_process_group()` after writing
+  `SUMMARY.json` (NCCL + cuda_graph teardown deadlock); `main.py` watchdog
+  detects this and force-kills after `--cleanup_grace_s` (default 90s).

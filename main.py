@@ -84,6 +84,14 @@ def _build_cmd(method: str, mode: str, args, out: Path, port: int) -> List[str]:
                 "--draft_device", "cuda:0", "--target_device", "cuda:1"]
     if spec.get("pipeline"):
         cmd += ["--pipeline"]
+    if method == "ours":
+        cmd += ["--partial_block_fill", "truncate"]
+        if args.return_timings:
+            cmd += ["--return_timings"]
+        if args.fused_denoise:
+            cmd += ["--fused_denoise"]
+        if args.speculative_target_extend:
+            cmd += ["--speculative_target_extend"]
     return cmd
 
 
@@ -242,11 +250,15 @@ def _print_table(combined: Dict[Tuple[str, str], Optional[Dict]],
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--target_model", required=True)
-    p.add_argument("--draft_model", required=True,
-                   help="Required for 'ours'; ignored by vanilla / vanilla_cg.")
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--datasets", nargs="+", default=["gsm8k", "humaneval", "mbpp"])
+    p.add_argument("--target_model", default="JetLM/SDAR-8B-Chat",
+                   help="HF hub id or local path. Default: JetLM/SDAR-8B-Chat.")
+    p.add_argument("--draft_model", default="JetLM/SDAR-1.7B-Chat",
+                   help="HF hub id or local path. Used by 'ours'; ignored by "
+                        "vanilla / vanilla_cg. Default: JetLM/SDAR-1.7B-Chat.")
+    p.add_argument("--output_dir", default="runs/main_table",
+                   help="Where SUMMARY.json / UNIFIED.json land. "
+                        "Default: runs/main_table.")
+    p.add_argument("--datasets", nargs="+", default=["gsm8k", "mbpp", "triviaqa", "mmlu"])
     p.add_argument("--num_samples", type=int, default=200)
     p.add_argument("--latency_num_blocks", type=int, default=32,
                    help="num_blocks × block_length = fixed gen length for latency mode (default 32×4=128 tokens).")
@@ -269,6 +281,27 @@ def main() -> int:
     p.add_argument("--skip_done", action="store_true",
                    help="If a job's SUMMARY.json already exists, skip rerunning "
                         "it (resume mode). Default: rerun and overwrite.")
+    p.add_argument("--return_timings", action="store_true",
+                   help="For 'ours' only: pass --return_timings to the runner "
+                        "so per-stage latency breakdown (draft denoise / verify "
+                        "/ extend / MRS-commit) is captured into SUMMARY.json.")
+    p.add_argument("--fused_denoise", dest="fused_denoise",
+                   action="store_true", default=True,
+                   help="For 'ours' only: fuse 4 denoise steps into one "
+                        "cuda_graph (default ON; use --no_fused_denoise to "
+                        "disable for ablation).")
+    p.add_argument("--no_fused_denoise", dest="fused_denoise",
+                   action="store_false")
+    p.add_argument("--speculative_target_extend",
+                   dest="speculative_target_extend",
+                   action="store_true", default=True,
+                   help="For 'ours' only: speculatively extend target K/V "
+                        "before MRS so target stream stays continuous "
+                        "(default ON; use --no_speculative_target_extend "
+                        "to disable for ablation).")
+    p.add_argument("--no_speculative_target_extend",
+                   dest="speculative_target_extend",
+                   action="store_false")
     p.add_argument("--cleanup_grace_s", type=int, default=90,
                    help="After SUMMARY.json is written, wait this many seconds "
                         "for the child to exit cleanly before force-killing its "

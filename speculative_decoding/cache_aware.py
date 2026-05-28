@@ -577,6 +577,42 @@ def _build_iter_attn_mask(cache: StaticBlockCache,
     return mask
 
 
+def _denoise_block_graph_dispatch(
+    model,
+    cache: StaticBlockCache,
+    ctx_aligned: int,
+    leftover: List[int],
+    block_length: int,
+    denoising_steps: int,
+    mask_token_id: int,
+    device: torch.device,
+    *,
+    sampling: str = "argmax",
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    remasking_strategy: str = "low_confidence_static",
+    confidence_threshold: float = 0.9,
+    early_stop_steps: int = -1,
+    fused: bool = False,
+) -> Tuple[List[int], torch.Tensor, List[int]]:
+    if fused and sampling == "argmax" \
+            and remasking_strategy == "low_confidence_static" \
+            and not (0 < early_stop_steps < denoising_steps):
+        return _denoise_block_fused_graph(
+            model, cache, ctx_aligned, leftover, block_length,
+            denoising_steps, mask_token_id, device,
+        )
+    return _denoise_block_graph(
+        model, cache, ctx_aligned, leftover, block_length, denoising_steps,
+        mask_token_id, device,
+        sampling=sampling, temperature=temperature, top_k=top_k, top_p=top_p,
+        remasking_strategy=remasking_strategy,
+        confidence_threshold=confidence_threshold,
+        early_stop_steps=early_stop_steps,
+    )
+
+
 def _denoise_block_graph(
     model,
     cache: StaticBlockCache,
@@ -712,6 +748,179 @@ def _denoise_block_graph(
         for i, tok in enumerate(draft_ids):
             if tok == mask_token_id:
                 new_step_map[i] = -1
+    return draft_ids, new_probs, new_step_map
+
+
+_FUSED_DENOISE_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+
+def _capture_fused_denoise_graph(
+    model,
+    block_length: int,
+    n_known: int,
+    denoising_steps: int,
+    cache: StaticBlockCache,
+    device: torch.device,
+    mask_token_id: int,
+) -> Optional[Dict[str, Any]]:
+    n_masks = block_length - n_known
+    if n_masks <= 0:
+        return None
+
+    n_unmask_per_step: List[int] = []
+    rem = n_masks
+    for s in range(denoising_steps):
+        rs = denoising_steps - s
+        n_u = -(-rem // rs)
+        if n_u <= 0:
+            break
+        n_unmask_per_step.append(int(n_u))
+        rem -= n_u
+
+    full_len = cache.full_len
+    B = cache.batch_size
+    vocab = model.config.vocab_size
+
+    static_input_ids = torch.full(
+        (B, block_length), mask_token_id, dtype=torch.long, device=device,
+    )
+    static_position_ids = torch.zeros(
+        (B, block_length), dtype=torch.long, device=device,
+    )
+    static_attn_mask = torch.zeros(
+        (B, 1, block_length, full_len), dtype=torch.bool, device=device,
+    )
+    static_cur_scratch_pos = torch.arange(
+        cache.max_cache_len, cache.max_cache_len + block_length,
+        dtype=torch.long, device=device,
+    )
+    static_cache_position = static_cur_scratch_pos.clone()
+    static_step_map = torch.zeros(block_length, dtype=torch.long, device=device)
+    static_per_pos_probs = torch.zeros(block_length, vocab, dtype=torch.float32, device=device)
+
+    def _run_body():
+        static_step_map.zero_()
+        static_per_pos_probs.zero_()
+        for step_i, n_u in enumerate(n_unmask_per_step):
+            out = model(
+                input_ids=static_input_ids,
+                attention_mask=static_attn_mask,
+                position_ids=static_position_ids,
+                past_key_values=cache,
+                use_cache=True,
+                store_kv=False,
+                cur_scratch_pos=static_cur_scratch_pos,
+                cache_position=static_cache_position,
+                return_dict=True,
+            )
+            logits = out.logits[0]
+            probs = F.softmax(logits.float(), dim=-1)
+            pred_ids = probs.argmax(dim=-1)
+            confidence = probs.gather(1, pred_ids.unsqueeze(-1)).squeeze(-1)
+            is_masked = (static_input_ids[0] == mask_token_id)
+            masked_conf = torch.where(
+                is_masked, confidence,
+                torch.full_like(confidence, float("-inf")),
+            )
+            _, top_pos = masked_conf.topk(n_u)
+            static_input_ids[0].scatter_(0, top_pos, pred_ids.gather(0, top_pos))
+            static_step_map.scatter_(
+                0, top_pos, torch.full_like(top_pos, step_i),
+            )
+            static_per_pos_probs.index_copy_(
+                0, top_pos, probs.index_select(0, top_pos),
+            )
+
+    with torch.cuda.device(device):
+        torch.cuda.synchronize(device)
+        s = torch.cuda.Stream(device=device)
+        s.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(s), torch.no_grad():
+            for _ in range(3):
+                static_input_ids.fill_(mask_token_id)
+                _run_body()
+        torch.cuda.current_stream(device).wait_stream(s)
+        torch.cuda.synchronize(device)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"), \
+                torch.no_grad():
+            _run_body()
+
+    return {
+        "graph": g,
+        "input_ids": static_input_ids,
+        "position_ids": static_position_ids,
+        "attn_mask": static_attn_mask,
+        "cur_scratch_pos": static_cur_scratch_pos,
+        "cache_position": static_cache_position,
+        "step_map": static_step_map,
+        "per_pos_probs": static_per_pos_probs,
+        "n_known": n_known,
+        "n_masks": n_masks,
+        "eff_steps": len(n_unmask_per_step),
+    }
+
+
+def _get_fused_denoise_graph(
+    model, block_length: int, n_known: int, denoising_steps: int,
+    cache: StaticBlockCache, device: torch.device, mask_token_id: int,
+) -> Optional[Dict[str, Any]]:
+    key = (id(model), int(block_length), int(n_known), int(denoising_steps),
+           int(cache.batch_size), str(device))
+    entry = _FUSED_DENOISE_CACHE.get(key)
+    if entry is None:
+        entry = _capture_fused_denoise_graph(
+            model, block_length, n_known, denoising_steps, cache, device,
+            mask_token_id,
+        )
+        if entry is not None:
+            _FUSED_DENOISE_CACHE[key] = entry
+    return entry
+
+
+def _denoise_block_fused_graph(
+    model,
+    cache: StaticBlockCache,
+    ctx_aligned: int,
+    leftover: List[int],
+    block_length: int,
+    denoising_steps: int,
+    mask_token_id: int,
+    device: torch.device,
+) -> Tuple[List[int], torch.Tensor, List[int]]:
+    n_known = len(leftover)
+    n_masks = block_length - n_known
+    vocab = model.config.vocab_size
+    if n_masks == 0:
+        return [], torch.zeros(0, vocab), []
+
+    entry = _get_fused_denoise_graph(
+        model, block_length, n_known, denoising_steps, cache, device,
+        mask_token_id,
+    )
+    if entry is None:
+        return [], torch.zeros(0, vocab), []
+
+    cur_x = list(leftover) + [mask_token_id] * n_masks
+    pos_ids = list(range(ctx_aligned, ctx_aligned + block_length))
+
+    intra = torch.ones(block_length, block_length, dtype=torch.bool, device=device)
+    attn_mask = _build_iter_attn_mask(cache, ctx_aligned, block_length, intra, device)
+
+    entry["input_ids"][0].copy_(
+        torch.as_tensor(cur_x, dtype=torch.long, device=device),
+    )
+    entry["position_ids"][0].copy_(
+        torch.as_tensor(pos_ids, dtype=torch.long, device=device),
+    )
+    entry["attn_mask"].copy_(attn_mask)
+
+    entry["graph"].replay()
+
+    draft_ids = entry["input_ids"][0, n_known:].tolist()
+    new_probs = entry["per_pos_probs"][n_known:].cpu()
+    new_step_map = entry["step_map"][n_known:].tolist()
     return draft_ids, new_probs, new_step_map
 
 
@@ -1492,6 +1701,7 @@ def speculative_generate_with_kv_cache(
     confidence_threshold = float(getattr(cfg, "confidence_threshold", 0.9))
     early_stop_steps = int(getattr(cfg, "draft_steps_per_block", -1))
     early_active = 0 < early_stop_steps < denoising_steps
+    fused_denoise = bool(getattr(cfg, "fused_denoise", False))
 
     verify_fn = _select_verify_fn(cfg)
     mrs_order = getattr(cfg, "mrs_verify_order", "position")
@@ -1844,6 +2054,8 @@ def speculative_generate_with_kv_cache_pipelined(
     confidence_threshold = float(getattr(cfg, "confidence_threshold", 0.9))
     early_stop_steps = int(getattr(cfg, "draft_steps_per_block", -1))
     early_active = 0 < early_stop_steps < denoising_steps
+    fused_denoise = bool(getattr(cfg, "fused_denoise", False))
+    speculative_target_extend = bool(getattr(cfg, "speculative_target_extend", False))
 
     verify_fn = _select_verify_fn(cfg)
     mrs_order = getattr(cfg, "mrs_verify_order", "position")
@@ -1936,13 +2148,14 @@ def speculative_generate_with_kv_cache_pipelined(
     # ── warmup: draft block 0 ─────────────────────────────────────────────
     n_known = len(leftover)
     n_masks = block_length - n_known
-    draft_ids, draft_probs, step_map = _denoise_block_graph(
+    draft_ids, draft_probs, step_map = _denoise_block_graph_dispatch(
         draft_model, draft_cache, draft_ctx_aligned, leftover,
         block_length, denoising_steps, mask_token_id, draft_device,
         sampling=sampling,
         remasking_strategy=remasking_strategy,
         confidence_threshold=confidence_threshold,
         early_stop_steps=early_stop_steps,
+        fused=fused_denoise,
     )
     stats["total_draft_tokens"] += sum(1 for s in step_map if s >= 0)
 
@@ -1986,6 +2199,7 @@ def speculative_generate_with_kv_cache_pipelined(
         is_last = (blk_idx == num_blocks - 1)
         next_draft = None
         opt_block_len = 0
+        opt_target_extended = False
         if not is_last:
             opt_block = list(leftover) + list(draft_ids)  # length == block_length
             opt_block_len = len(opt_block)
@@ -1999,19 +2213,26 @@ def speculative_generate_with_kv_cache_pipelined(
                 draft_model, draft_cache, draft_ctx_aligned, opt_block,
                 draft_device,
             )
+            if speculative_target_extend:
+                target_ctx_aligned = _extend_cache_graph(
+                    target_model, target_cache, target_ctx_aligned, opt_block,
+                    target_device,
+                )
+                opt_target_extended = True
             if return_timings:
                 with torch.cuda.device(draft_device):
                     ev["ext_end"].record()
                     ev["den_start"].record()
             # draft_{N+1}: leftover for the next block is empty (we just
             # optimistically flushed the current block). n_masks_next == bl.
-            next_draft = _denoise_block_graph(
+            next_draft = _denoise_block_graph_dispatch(
                 draft_model, draft_cache, draft_ctx_aligned, [],
                 block_length, denoising_steps, mask_token_id, draft_device,
                 sampling=sampling,
                 remasking_strategy=remasking_strategy,
                 confidence_threshold=confidence_threshold,
                 early_stop_steps=early_stop_steps,
+                fused=fused_denoise,
             )
             if return_timings:
                 with torch.cuda.device(draft_device):
@@ -2097,24 +2318,22 @@ def speculative_generate_with_kv_cache_pipelined(
         all_generated.extend(final_ids)
 
         if full_accept:
-            # opt_extend already wrote correct K/V at draft_cache[draft_ctx_aligned-bl, draft_ctx_aligned).
-            # Mirror to target_cache: extend with the same block (which equals
-            # leftover[:bl] now).
             assert len(leftover) >= block_length, \
                 f"full_accept must produce at least block_length tokens in leftover (got {len(leftover)})"
             full_block = leftover[:block_length]
-            target_ctx_aligned = _extend_cache_graph(
-                target_model, target_cache, target_ctx_aligned, full_block,
-                target_device,
-            )
+            if not opt_target_extended:
+                target_ctx_aligned = _extend_cache_graph(
+                    target_model, target_cache, target_ctx_aligned, full_block,
+                    target_device,
+                )
             leftover = leftover[block_length:]
-            # next_draft is valid  its prefix matches reality.
             draft_ids, draft_probs, step_map = next_draft
             stats["pipeline_reused_next_draft"] += 1
         else:
-            # Rollback draft_cache: undo the optimistic extend.
             if not is_last:
                 draft_ctx_aligned -= opt_block_len
+                if opt_target_extended:
+                    target_ctx_aligned -= opt_block_len
                 stats["pipeline_rollback_next_draft"] += 1
             # Now draft_ctx_aligned == target_ctx_aligned (both at iter-start state).
             # Apply the canonical "flush leftover when full" rule on BOTH caches.
@@ -2124,13 +2343,14 @@ def speculative_generate_with_kv_cache_pipelined(
                 next_n_known = len(leftover)
                 next_n_masks = block_length - next_n_known
                 if next_n_masks > 0:
-                    draft_ids, draft_probs, step_map = _denoise_block_graph(
+                    draft_ids, draft_probs, step_map = _denoise_block_graph_dispatch(
                         draft_model, draft_cache, draft_ctx_aligned, leftover,
                         block_length, denoising_steps, mask_token_id, draft_device,
                         sampling=sampling,
                         remasking_strategy=remasking_strategy,
                         confidence_threshold=confidence_threshold,
                         early_stop_steps=early_stop_steps,
+                        fused=fused_denoise,
                     )
                 else:
                     # leftover already fills a block  would be flushed above.

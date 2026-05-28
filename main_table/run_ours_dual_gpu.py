@@ -80,6 +80,20 @@ def main():
                    help="Use speculative_generate_with_kv_cache_pipelined "
                         "(draft on cuda:0 + target on cuda:1 overlap). "
                         "Requires use_cuda_graph=True and distinct devices.")
+    p.add_argument("--return_timings", action="store_true", default=False,
+                   help="Capture per-stage timing breakdown (draft denoise / "
+                        "verify / extend / MRS-commit GPU + wall) from gen_fn "
+                        "and aggregate per dataset into SUMMARY.json.")
+    p.add_argument("--fused_denoise", action="store_true", default=False,
+                   help="Fuse all denoising_steps denoise iterations into a "
+                        "single cuda_graph (saves 3x dispatch + Python loop "
+                        "overhead). Requires argmax + low_confidence_static "
+                        "+ no early-stop. Cached per n_known.")
+    p.add_argument("--speculative_target_extend", action="store_true", default=False,
+                   help="Mirror the optimistic draft extend on the target "
+                        "cache: speculatively extend target K/V before MRS "
+                        "so target stream stays continuous (no idle wait "
+                        "for MRS). Rolls back on reject like draft side.")
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -127,6 +141,8 @@ def main():
         confidence_threshold=args.confidence_threshold,
         use_cuda_graph=args.use_cuda_graph,
         kv_cache_max_len=args.kv_cache_max_len,
+        fused_denoise=args.fused_denoise,
+        speculative_target_extend=args.speculative_target_extend,
     )
 
     summary = {"runs": []}
@@ -146,11 +162,16 @@ def main():
             t_start = time.time()
             ev_start.record(stream=torch.cuda.current_stream(target_device))
             eos_ids_arg = [eos_id] if eos_id is not None else None
-            gen_ids, stats = gen_fn(
+            ret = gen_fn(
                 draft_model, target_model, pids, cfg,
                 pad_token_id=pad_id, padded_len=plen + args.num_blocks * args.block_length,
-                eos_ids=eos_ids_arg, return_timings=False,
+                eos_ids=eos_ids_arg, return_timings=args.return_timings,
             )
+            if args.return_timings:
+                gen_ids, stats, timing = ret
+            else:
+                gen_ids, stats = ret
+                timing = None
             ev_end.record(stream=torch.cuda.current_stream(target_device))
             ev_end.synchronize()
             gpu_ms = ev_start.elapsed_time(ev_end)
@@ -160,7 +181,7 @@ def main():
             a = stats.get("total_accepted_tokens", 0) or 0
             d = stats.get("total_draft_tokens", 1) or 1
             alpha = a / d if d else 0.0
-            results.append({
+            rec = {
                 "idx": i, "prompt_len": plen, "n_tokens": len(gen_ids),
                 "end_to_end_s": dt, "gpu_event_ms": gpu_ms, "text": txt,
                 "spec_acceptance": {
@@ -169,7 +190,10 @@ def main():
                     "total_bonus_tokens": int(stats.get("total_bonus_tokens", 0) or 0),
                     "accept_rate": alpha,
                 },
-            })
+            }
+            if timing is not None:
+                rec["timing"] = {k: v for k, v in timing.items() if k != "per_block"}
+            results.append(rec)
             preview = txt.replace("\n", "⏎")[:60]
             print(f"  [{dataset} {i+1:>3}/{len(prompt_ids)}] {len(gen_ids):>3}t  "
                   f"{dt:.2f}s  gpu={gpu_ms:.0f}ms  α={alpha:.2f}  {preview!r}",
@@ -199,6 +223,18 @@ def main():
             "ms_per_token": ms_per_tok, "tokens_per_second": tok_per_s,
             "pass_at_1": pass_at_1, "mean_accept_rate": mean_alpha,
         }
+        if args.return_timings and timed and timed[0].get("timing"):
+            stage_keys = [k for k in timed[0]["timing"].keys()
+                          if isinstance(timed[0]["timing"][k], (int, float))]
+            stage_totals = {}
+            for k in stage_keys:
+                tot = sum(r["timing"].get(k, 0.0) for r in timed)
+                stage_totals[f"sum_{k}"] = tot
+                stage_totals[f"mean_per_sample_{k}"] = tot / len(timed)
+                if total_tok:
+                    unit_to_ms = 1000.0 if k.endswith("_s") else 1.0
+                    stage_totals[f"ms_per_token_{k}"] = tot * unit_to_ms / total_tok
+            run["timing_breakdown"] = stage_totals
         summary["runs"].append(run)
         (out_dir / f"ours_dual_gpu_{dataset}.jsonl").write_text(
             "\n".join(json.dumps(r) for r in results) + "\n"
