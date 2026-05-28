@@ -250,7 +250,7 @@ def patch_multi_block_mask_fn(model, block_causal_prompt: bool = True):
         block_causal_prompt: True = SDAR block-level causal (prompt doesn't see data/mask)
                              False = legacy (prompt sees all prompt + mask tokens)
     """
-    from new_attn_multi_block import create_multi_block_causal_mask
+    from sdar.new_attn_multi_block import create_multi_block_causal_mask
     model_module = sys.modules[type(model).__module__]
     bcp = block_causal_prompt  # capture in closure
 
@@ -481,7 +481,7 @@ def target_verify_forward_multi(
     model.config.block_size = block_size
     if use_eval_sdpa:
         model.eval()
-        from new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
+        from sdar.new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
         attn_mask_4d = _mbc_mask_fn(tl_t, bi_t, block_size, block_causal_prompt=True)
     else:
         model.train()
@@ -621,7 +621,7 @@ def target_verify_forward(model, prompt_ids, accepted_blocks, draft_ids, step_ma
     model.config.block_size = block_size
     if use_eval_sdpa:
         model.eval()
-        from new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
+        from sdar.new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
         # NOTE: _mbc_mask_fn  .item() (block_ids.max(), blk_data_cnt.max()),
         #  GPUCPU sync,  mask ,  ~1-2ms,
         #  SDARAttention.forward  torch.all sync (~36ms).
@@ -782,7 +782,7 @@ def target_verify_forward_multi_batch(
     model.config.block_size = block_size
     if use_eval_sdpa:
         model.eval()
-        from new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
+        from sdar.new_attn_multi_block import create_multi_block_causal_mask as _mbc_mask_fn
         # _mbc_mask_fn expects (B, L) token_labels / block_ids; it builds the
         # 4D mask per row, so the batched call works directly.
         attn_mask_4d = _mbc_mask_fn(tl_t, bi_t, block_size,

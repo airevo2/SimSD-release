@@ -106,12 +106,13 @@ def _select_verify_fn(cfg):
     if branch == "greedy_match":
         return greedy_match_verify
     return mrs_verify
-from speculative_decoding.visualize import plot_single_block, plot_multi_block
-from speculative_decoding.visualize_ascii import (
-    print_draft_steps,
-    print_verify_layout,
-    print_mrs_result,
-)
+# Visualization removed in release; stubs preserve CLI/config compat
+# (--save_plots, --ascii_demo flags become no-ops).
+def plot_single_block(*_a, **_kw): return None
+def plot_multi_block(*_a, **_kw): return None
+def print_draft_steps(*_a, **_kw): return ""
+def print_verify_layout(*_a, **_kw): return ""
+def print_mrs_result(*_a, **_kw): return ""
 
 
 def _out_prefix(cfg):

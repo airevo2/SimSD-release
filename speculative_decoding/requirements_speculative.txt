@@ -1,5 +1,0 @@
-#  evaluation/environment.yml  opencompass
-# : huggingface-hub>=0.30.0,<1.0 is required ... but found huggingface-hub==1.7.1
-#  opencompass :
-#   pip install -r speculative_decoding/requirements_speculative.txt
-huggingface-hub>=0.30.0,<1.0

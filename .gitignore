@@ -69,6 +69,7 @@ speculative_decoding/throughput/
 speculative_decoding/test/
 speculative_decoding/Experiment_Backend/results/
 outputs/
+runs/
 
 # Plots / artifacts
 *.png

@@ -187,6 +187,17 @@ class StaticBlockCache(Cache):
       [max_cache_len, full_len)       : scratch for current forward's cur_x
     """
 
+    # transformers 4.55+ made Cache.max_cache_len a read-only property. Shadow
+    # it with a read/write property on this subclass so existing
+    # `self.max_cache_len = ...` and `cache.max_cache_len` reads keep working.
+    @property
+    def max_cache_len(self):
+        return self._max_cache_len
+
+    @max_cache_len.setter
+    def max_cache_len(self, v):
+        self._max_cache_len = v
+
     def __init__(self, model, max_cache_len: int, max_cur_len: int,
                  device: torch.device, dtype: torch.dtype,
                  batch_size: int = 1, n_kv_heads_override: int = None,

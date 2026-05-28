@@ -29,7 +29,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from speculative_decoding.bench.backends import (  # noqa: E402
