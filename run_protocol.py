@@ -118,7 +118,14 @@ def resolve_models(cfg: dict, bl: int | None) -> tuple[str, str | None, int]:
         m = ck[bl]
         return m["target"], m.get("draft"), bl
     m = cfg["models"]
-    return m["target"], m.get("draft"), bl if bl is not None else cfg["args"]["block_length"]
+    if bl is None:
+        bl = cfg["args"]["block_length"]
+    elif (choices := cfg.get("bl_choices")) and bl not in choices:
+        # Not an error: one model pair covers every bl, so the weights exist. It
+        # just is not one of the swept points, so there is no matching baseline.
+        print(f"[protocol] note: bl={bl} is outside {cfg['name']}'s swept set "
+              f"{choices}; results will have no matching reference run.", flush=True)
+    return m["target"], m.get("draft"), bl
 
 
 def runner_flags(runner: str) -> set[str]:
@@ -231,7 +238,8 @@ def main() -> int:
                     help="one of the YAML's arms, or both (= default_arms, serial)")
     ap.add_argument("--bl", type=int, default=None,
                     help="override block_length (ds and num_blocks follow). "
-                         "SDAR only accepts values that have a checkpoint pair.")
+                         "SDAR only accepts values that have a checkpoint pair; "
+                         "LLaDA2 accepts any, and warns outside its swept set.")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VAL",
                     help="override any args key, e.g. --set num_samples=20 datasets='[gsm8k]'")
     ap.add_argument("--dry_run", action="store_true", help="print the command, do not run")
@@ -242,8 +250,10 @@ def main() -> int:
         print("available experiments (configs/protocol/):")
         for f in sorted(CONFIG_DIR.glob("*.yaml")):
             c = yaml.safe_load(f.read_text()) or {}
-            bls = sorted(c["checkpoints"]) if "checkpoints" in c else \
-                [c.get("args", {}).get("block_length")]
+            if "checkpoints" in c:
+                bls = sorted(c["checkpoints"])          # hard limit: one pair per bl
+            else:
+                bls = c.get("bl_choices") or [c.get("args", {}).get("block_length")]
             print(f"  {f.stem:16s} {c.get('family','?'):7s} {c.get('mode','?'):8s} "
                   f"bl={bls}  arms={list(c.get('arms') or {})}")
             if d := c.get("note"):

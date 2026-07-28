@@ -37,6 +37,10 @@ runner: main_table/run_paper_protocol.py
 target_max_memory: 88GiB
 default_arms: [target, ours]
 
+# Block lengths that were actually swept; --bl picks one. LLaDA2 uses one model
+# pair for all of them (unlike SDAR, which needs a different checkpoint per bl).
+bl_choices: [4, 8, 16, 32]
+
 arms:
   ours:
     method: simsd_dual
