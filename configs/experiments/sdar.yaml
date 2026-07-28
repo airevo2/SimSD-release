@@ -1,0 +1,94 @@
+# SDAR main-table experiment — the paper configuration.
+#
+#   python main.py                                  # this file is the default
+#   python main.py --experiment configs/experiments/sdar.yaml
+#
+# Every value here is also overridable on the CLI (`--num_samples 20`), so this
+# file records the *setting*, not a hard constraint. Anything omitted falls back
+# to the runner's own default.
+
+name: sdar-main-table
+family: sdar          # selects the adapter's mask id; the runners still detect
+                      # the actual family from the loaded checkpoint
+
+models:
+  target: JetLM/SDAR-8B-Chat
+  draft: JetLM/SDAR-1.7B-Chat     # used by `ours`; ignored by the baselines
+
+tokens:
+  # SDAR's <|mask|>. Kept explicit so a run log is self-describing.
+  mask_token_id: 151669
+
+block:
+  block_length: 4
+  denoising_steps: 4
+
+data:
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+  num_samples: 200
+
+methods: [vanilla, vanilla_cg, ours]
+modes: [latency, quality]
+
+# num_blocks x block_length = generation budget.
+#   latency: fixed 128-token generation, no EOS stop → pure throughput
+#   quality: 512-token budget, EOS stop on → pass@1 + acceptance rate
+mode_settings:
+  latency:
+    num_blocks: 32
+  quality:
+    num_blocks: 128
+
+runtime:
+  gpus: "0,1"                     # CUDA_VISIBLE_DEVICES for every subprocess
+  draft_device: cuda:0            # `ours` only (single process, two cards)
+  target_device: cuda:1
+  use_cuda_graph: true            # gate: per-method graph use is ANDed with this
+  pipeline: true                  # gate: `ours` overlaps draft/verify streams
+  fused_denoise: true
+  speculative_target_extend: true
+  return_timings: false
+  seed: 42
+  # Kernel-side optimisations (docs/kernel-optimization.md,
+  # docs/optimize-extend.md, docs/latency-breakdown.md §6-7). All three are
+  # cuda_graph-path work and measured on SDAR:
+  #   kv_cache_max_len: 0  auto-size to max_prompt_len + gen_length. Every
+  #       forward scans the whole StaticBlockCache, so the fixed 1024 wastes
+  #       bandwidth on short prompts.               58.3 -> 79.0 tok/s (with pinned staging)
+  #   fold_draft_extend    fold the draft-side extend into the next fused
+  #       denoise graph, one fewer draft forward per block.   79.0 -> 91.2 tok/s
+  #   fused_linear: draft  route the draft's thin nn.Linear through the split-K
+  #       GEMV kernel. NOT byte-identical to cuBLAS -- gate with
+  #       scripts/37_fused_linear_quality.sh.                 79.2 -> 90.0 tok/s
+  # Left at the conservative defaults here so `python main.py` reproduces the
+  # released numbers; flip them on for the optimised run.
+  kv_cache_max_len: 1024
+  fold_draft_extend: false
+  fused_linear: off
+
+# Decode knobs. `spec` applies to every method that accepts the flag;
+# `method_spec` overrides it per method. The three methods deliberately differ:
+# `vanilla` IS the multinomial reference (generate.py:block_diffusion_generate),
+# `vanilla_cg` IS its argmax + cuda_graph twin. Spelling both out here rather
+# than relying on each runner's default keeps the paper configuration readable
+# from one file — the values below are exactly those defaults.
+spec:
+  confidence_threshold: 0.9      # only read by remasking_strategy=*_dynamic
+
+method_spec:
+  vanilla:
+    draft_sampling: multinomial
+    remasking_strategy: low_confidence_dynamic
+    temperature: 1.0
+    top_k: 0
+    top_p: 1.0
+  vanilla_cg:
+    remasking_strategy: low_confidence_static
+  ours:
+    draft_sampling: argmax
+    speculative_branch: greedy_match   # argmax-equivalent lossless rule
+    mrs_verify_order: position
+    partial_block_fill: truncate
+    remasking_strategy: low_confidence_static
+
+output_dir: runs/main_table

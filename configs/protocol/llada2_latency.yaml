@@ -1,0 +1,63 @@
+# LLaDA2 · latency 档 —— 报吞吐用这一档
+#
+#   python run_protocol.py llada2_latency --arm ours
+#
+# 目的：纯吞吐。关 EOS、定长生成，两个 arm 产出相同 token 数，tok/s 之比就是
+# 纯时间比，不掺 EOS 造成的长度差异。
+#
+# ⚠ 这一档的 pass_at_1 是垃圾，不要引用。定长会把答案截断在中间，实测
+#   target gsm8k 只有 0.22–0.25（quality 档是 0.925）。质量一律看
+#   llada2_quality.yaml。汇总脚本检测到 no_eos_stop 会主动打印这条警告。
+
+name: llada2_latency
+family: llada2
+mode: latency
+
+models:
+  target: inclusionAI/LLaDA2.0-flash
+  draft: inclusionAI/LLaDA2.0-mini
+
+runner: main_table/run_paper_protocol.py
+target_max_memory: 88GiB
+default_arms: [target, ours]
+
+arms:
+  ours:
+    method: simsd_dual
+    needs_draft: true
+    draft_device: cuda:0
+    target_gpus: [1, 2, 3, 4]
+  target:
+    method: native_single
+    target_gpus: [0, 1, 2, 3, 4]
+
+args:
+  mask_token_id: 156895
+  dtype: bfloat16
+  seed: 42
+
+  block_length: 16
+  denoising_steps: 16
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax
+  speculative_branch: greedy_match
+  partial_block_fill: truncate
+
+  prompts: opencompass
+  shuffle_seed: 42
+  mmlu_style: 5shot
+
+  # ── 与 quality 档的唯一区别 ──
+  no_eos_stop: true                   # 关 EOS
+  gen_length: 128                     # 定长；bl=4/8/16/32 -> 32/16/8/4 次迭代
+                                      # gen_length 必须能被 block_length 整除
+  num_samples: 100                    # 只看吞吐，方差远小于 pass@1；预算让给 quality 档
+  n_warmup: 3                         # -> 97 条计时
+  kv_cache_max_len: 0
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  fused_moe: true
+
+# 该看的指标：tokens_per_second_paper（排除 prefill）。
+# SUMMARY 里另有 tokens_per_second（含 prefill，数值更低），不要用它。
+output_dir: runs/protocol/llada2_latency

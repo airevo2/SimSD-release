@@ -1,0 +1,69 @@
+# LLaDA2 · quality 档 —— 报 pass@1 用这一档
+#
+#   python run_protocol.py llada2_quality --arm ours
+#
+# 目的：pass@1。开 EOS 让答案自然结束，OC 的 per-dataset max_out_len 作预算，
+# 所以不同 block_length 拿到同一个 token 预算，只有迭代次数不同。
+#
+# ⚠ 这一档的墙钟不可横向比 —— 各 arm 生成长度不同（实测 target 226 token/样本
+#   vs ours 204）。吞吐一律看 llada2_latency.yaml。
+
+name: llada2_quality
+family: llada2
+mode: quality
+
+models:
+  target: inclusionAI/LLaDA2.0-flash      # 102.9 B 总 / 6.1 B 激活 / 191.6 GiB bf16
+  draft: inclusionAI/LLaDA2.0-mini        #  16.3 B 总 / 1.4 B 激活 /  30.3 GiB bf16
+  # 同一个 tokenizer（vocab 157184），draft/target token id 直接可比，无需映射。
+
+# 每个 arm 5 张卡：硬件预算对齐。实测第 5 张对朴素模型并行只值 +0.3%
+# （单次前向 130.67 -> 130.31 ms），给 baseline 补到 5 张只为消除「谁用了几张卡」。
+runner: main_table/run_paper_protocol.py
+target_max_memory: 88GiB      # 卡是 96 GB
+default_arms: [target, ours]
+
+arms:
+  ours:
+    method: simsd_dual        # nopipe：simsd_pipe 要求两侧都能 capture，分片 flash 不能
+    needs_draft: true
+    draft_device: cuda:0      # mini 整卡
+    target_gpus: [1, 2, 3, 4] # flash 191.6 GiB 必须跨 4 卡
+  target:
+    method: native_single
+    target_gpus: [0, 1, 2, 3, 4]
+
+args:
+  # ── 家族 ──
+  mask_token_id: 156895               # LLaDA2 的 <mask>，不是 SDAR 的 151669
+  dtype: bfloat16
+  seed: 42
+
+  # ── 解码 ──
+  block_length: 16                    # 当前工作点，见 docs/rebuttal_result
+  denoising_steps: 16                 # ds = bl：每步揭 1 个位置（受控，前向数不随数据变）
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax
+  speculative_branch: greedy_match
+  partial_block_fill: truncate        # 拒绝后只提交已接受前缀，不填满块
+
+  # ── 三条口径红线（都踩过坑，不遵守数字不能用）──
+  prompts: opencompass                # repo 手写 0-shot 在 gsm8k 只有 0.78，OC 下 0.925
+  shuffle_seed: 42                    # MMLU test 按科目排序，前 N 条 = 最窄的两个科目
+  mmlu_style: 5shot                   # 直接出答案。CoT 让迭代预算变成质量的隐藏变量
+
+  # ── 预算与样本 ──
+  gen_length: 0                       # 0 = 用 OC 的 per-dataset max_out_len
+                                      #     gsm8k/mbpp 512、triviaqa 64、mmlu-5shot 256
+  num_samples: 200
+  n_warmup: 3                         # -> 197 条计时
+  kv_cache_max_len: 0                 # 0 = 按 max_prompt + gen 自动定尺
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  # ── kernel / graph ──
+  fused_moe: true                     # grouped-GEMM 专家派发，两侧都开。
+                                      # stock moe_infer 占单次前向 65% 且有 host sync
+  # no_cuda_graph 不给 -> 按角色决定：draft 单卡捕获 / target 分片 eager。
+  # 两个 arm 的 target 实现因此完全一致。NO_GRAPH=1 可强制两侧 eager。
+
+output_dir: runs/protocol/llada2_quality

@@ -79,3 +79,44 @@ runs/
 # Datasets / rollouts
 data/
 *.jsonl
+
+# Kernel 调优 workspace：默认全部不跟踪，只放行「正确性门禁」那几个文件。
+#
+# 不跟踪的原因分两类：
+#   * oracle/*.pt 共 44 GB（flash_T32_fp32.pt 单个 12 GB —— 存了 256 个专家的
+#     完整权重）。可再生，见下。
+#   * report.html / plan.md / draft.md / benchmark*.csv / duipai_*.csv /
+#     profile.ncu-rep 是调优过程的残留。ncu-rep 还是二进制且与 GPU 型号绑定
+#     （本轮在 SM 12.0 上跑的），换机器无意义。
+#
+# 放行的原因：生产 kernel（kernels/*.py）不 import workspace，所以 workspace 不是
+# 运行时依赖 —— 但它是 kernel **可验证性**的全部来源。没有 duipai.py +
+# build_oracle.py + oracle/manifest.jsonl，moe_dispatch_fused.py 就成了一个只能
+# 信任、无法复核的 kernel；而它并非普通优化（fused MoE 让 α 从 0.761 掉到 0.556，
+# 因为 draft 与 target 各自独立翻转 token）。CONTRACT.md 记着 training/inference
+# 模式的 pin，是改 kernel 前必读的。
+#
+# oracle 怎么重建：在 repo 根跑
+#     python kernels/workspace/<kernel>/build_oracle.py
+# manifest.jsonl 记着每个 fixture 的 T/k/E/H/I/dtype/scale/concentration。
+kernels/workspace/**
+# 必须先把目录整体放行，否则 git 不会往被排除的目录里走，下面的 ! 全部失效。
+!kernels/workspace/**/
+!kernels/workspace/__init__.py
+!kernels/workspace/*/__init__.py
+!kernels/workspace/*/CONTRACT.md
+!kernels/workspace/*/build_oracle.py
+!kernels/workspace/*/duipai.py
+!kernels/workspace/*/verify_model.py
+!kernels/workspace/*/oracle/manifest.jsonl
+
+# Local-only: 文档、模型副本、编排脚本
+#   docs/     结果文档与 HTML 总表（大量随实验滚动的中间结论）
+#   models/   本地 checkpoint 副本（SDAR-1_7B-Chat 等，从 HF 下载）
+#   scripts/  编排脚本与环境（env.sh、各档 sweep driver）
+# 注意：run_protocol.py 与 configs/protocol/*.yaml 是标定实验的唯一入口和唯一
+# 设定出处，两者都被跟踪 —— 否则「跑的是什么」就没有记录。scripts/env.sh 的内容
+# 已内联进 run_protocol.py 的 ENV_DEFAULTS，所以入口不依赖 scripts/。
+docs/
+models/
+scripts/

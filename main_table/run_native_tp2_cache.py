@@ -64,6 +64,12 @@ def main():
     p.add_argument("--kv_cache_max_len", type=int, default=1024,
                    help="StaticBlockCache permanent slot size; smaller cuts "
                         "redundant K/V scan (caps prompt + gen length).")
+    # Exposed so a YAML experiment can set the same denoise schedule on all
+    # three methods. Defaults reproduce the pre-flag hardcoded behaviour.
+    p.add_argument("--remasking_strategy", default="low_confidence_static",
+                   choices=["low_confidence_static", "low_confidence_dynamic"])
+    p.add_argument("--confidence_threshold", type=float, default=0.9,
+                   help="Only read by remasking_strategy=low_confidence_dynamic.")
     p.add_argument("--datasets", nargs="+",
                    default=["gsm8k", "humaneval", "mbpp"])
     args = p.parse_args()
@@ -129,6 +135,8 @@ def main():
         num_blocks=args.num_blocks,
         mask_token_id=args.mask_token_id,
         draft_sampling="argmax",          # argmax  deterministic across ranks
+        remasking_strategy=args.remasking_strategy,
+        confidence_threshold=args.confidence_threshold,
         use_cuda_graph=args.use_cuda_graph,
         kv_cache_max_len=args.kv_cache_max_len,
         n_kv_heads_override=n_kv_sharded,

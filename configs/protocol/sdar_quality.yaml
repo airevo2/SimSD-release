@@ -1,0 +1,76 @@
+# SDAR · quality 档 —— truncate + argmax，与 llada2_quality 对齐的口径
+#
+#   python run_protocol.py sdar_quality --arm ours              # bl=4
+#   python run_protocol.py sdar_quality --arm ours --bl 8       # bl=8（换 checkpoint）
+#
+# 这一份复现的是 runs/t1/*_am_oc_s42_n200，即 argmax + greedy_match + truncate
+# 那一套，逐项与 LLaDA2 对齐（含 mmlu_style: 5shot，见下）。
+#
+# ⚠ SDAR 的 bl=4 和 bl=8 是两对**不同的 checkpoint**（按 block length 分别训练），
+#   不是同一模型换参数 —— 这与 LLaDA2 不同，见 checkpoints 段。
+#
+# ⚠ MMLU 的加速比在 SDAR 上低于 1（bl=4 0.87×、bl=8 0.62×）：5shot 只生成 6–8 个
+#   token，SDAR 的 block 是 4/8，一两个 block 就结束，投机的固定成本摊不开。
+#   报速度均值时要么标注输出长度，要么把 MMLU 排除并说明。
+
+name: sdar_quality
+family: sdar
+mode: quality
+
+# SDAR 每个 block length 有独立的 checkpoint 对。--bl 选哪一对。
+checkpoints:
+  4:
+    target: JetLM/SDAR-8B-Chat
+    draft: ./models/SDAR-1_7B-Chat       # 本地副本
+  8:
+    target: JetLM/SDAR-8B-Chat-b8
+    draft: JetLM/SDAR-1.7B-Chat-b8
+
+# 8B 装得下单卡，所以不需要分片：draft 和 target 各占一张。
+runner: main_table/run_paper_protocol.py
+default_arms: [target, ours]
+
+arms:
+  ours:
+    method: simsd_pipe                   # SDAR 两侧都能 capture -> 可以流水
+    needs_draft: true
+    draft_device: cuda:0
+    target_device: cuda:1
+  target:
+    method: native_single
+    target_device: cuda:0
+
+args:
+  mask_token_id: 151669                  # SDAR 的 <mask>
+  dtype: bfloat16
+  seed: 42
+
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax                 # 与 LLaDA2 对齐（论文 Eq.2 的 MRS 见下方注释）
+  speculative_branch: greedy_match
+  partial_block_fill: truncate
+  temperature: 1.0
+  top_p: 1.0
+
+  prompts: opencompass
+  shuffle_seed: 42
+  mmlu_style: 5shot                      # 与 LLaDA2 对齐。runs/t1 原本用的是
+                                         # simple_evals（0-shot CoT），那让迭代预算成了
+                                         # 隐藏变量：MMLU 掉 12.5pp(bl=4)/19.0pp(bl=8)，
+                                         # 切 5shot 后两个 bl 都精确 ±0.0。
+                                         # 补跑的数据在 runs/sdar_align/。
+
+  gen_length: 0
+  num_samples: 200
+  n_warmup: 3
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  # SDAR 两侧都能 capture，所以这两个优化可用（LLaDA2 走 nopipe 用不上）。
+  fused_denoise: true
+  speculative_target_extend: true
+  # no_cuda_graph 不给 -> 两侧都捕获。
+
+# 论文 §4.1 的采样是 multinomial + MRS（Eq.2）；本文件用 argmax + greedy_match
+# 以便与 LLaDA2 直接对比。论文口径的那一套在 runs/t1/*_mrs_oc_s42_n200，
+# 换法：draft_sampling: multinomial / speculative_branch: mrs。
+output_dir: runs/protocol/sdar_quality

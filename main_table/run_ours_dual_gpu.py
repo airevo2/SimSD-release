@@ -34,12 +34,53 @@ from speculative_decoding.cache_aware import (
 from sdar.run_native_tp2 import patch_stock_rms_norm
 
 
-def _load(model_path: str, device: torch.device):
-    m = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
-    ).to(device).eval()
+def _parse_gpu_list(spec):
+    """"1,2,3" -> [1, 2, 3]. Indices are LOCAL, i.e. after CUDA_VISIBLE_DEVICES."""
+    if not spec:
+        return None
+    return [int(x) for x in str(spec).replace(" ", "").split(",") if x != ""]
+
+
+def _load(model_path: str, device: torch.device, shard_gpus=None,
+          max_memory_per_gpu: str = "88GiB"):
+    """Load one model, either whole onto ``device`` or sharded across GPUs.
+
+    Sharding exists for targets that do not fit on one card — LLaDA2.0-flash is
+    191.6 GiB in bf16 against 95.6 GiB usable. ``device_map="auto"`` lays the layers
+    out sequentially and accelerate hooks each one to move activations across
+    the boundary.
+
+    This is *naive* model parallelism, not tensor parallelism — and not pipeline
+    parallelism either, despite the layer-wise split. Real PP splits the batch
+    into micro-batches so several stages run at once; here a single input walks
+    the layers strictly in order and exactly one GPU is busy at a time. At bs=1
+    that costs nothing (there is nothing to pipeline), but it does mean the
+    placement buys capacity, not speed: only TP parallelises within a layer.
+
+    ``max_memory`` is restricted to ``shard_gpus`` so the planner cannot spill
+    onto the draft's card. Layers stay whole — the checkpoint declares
+    ``_no_split_modules = ["LLaDA2MoeDecoderLayer"]``.
+    """
+    kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=True)
+    if shard_gpus:
+        kwargs["device_map"] = "auto"
+        kwargs["max_memory"] = {g: max_memory_per_gpu for g in shard_gpus}
+        m = AutoModelForCausalLM.from_pretrained(model_path, **kwargs).eval()
+    else:
+        m = AutoModelForCausalLM.from_pretrained(
+            model_path, **kwargs).to(device).eval()
     n_rms = patch_stock_rms_norm(m)
     return m, n_rms
+
+
+def _placement(model) -> str:
+    dm = getattr(model, "hf_device_map", None)
+    if not dm:
+        return str(next(model.parameters()).device)
+    per = {}
+    for name, dev in dm.items():
+        per.setdefault(str(dev), []).append(name)
+    return "  ".join(f"cuda:{d}={len(v)}mod" for d, v in sorted(per.items()))
 
 
 def main():
@@ -47,7 +88,18 @@ def main():
     p.add_argument("--draft_model", required=True)
     p.add_argument("--target_model", required=True)
     p.add_argument("--draft_device", default="cuda:0")
-    p.add_argument("--target_device", default="cuda:1")
+    p.add_argument("--target_device", default="cuda:1",
+                   help="Ignored when --target_gpus is given: the entry device "
+                        "is then whatever accelerate puts the embedding on.")
+    p.add_argument("--target_gpus", default=None,
+                   help="Shard the target across these LOCAL GPU indices (after "
+                        "CUDA_VISIBLE_DEVICES), e.g. '1,2,3'. For targets too "
+                        "big for one card — LLaDA2.0-flash is 191.6 GiB bf16. "
+                        "Unset = load the target whole onto --target_device.")
+    p.add_argument("--target_max_memory", default="88GiB",
+                   help="Per-GPU cap handed to accelerate's planner when "
+                        "--target_gpus is set. Leave headroom for K/V + "
+                        "activations; 88GiB of a 96 GB card is a safe default.")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--num_samples", type=int, default=40)
     p.add_argument("--num_blocks", type=int, default=32)
@@ -57,7 +109,12 @@ def main():
     p.add_argument("--mask_token_id", type=int, default=151669)
     p.add_argument("--no_eos_stop", action="store_true", default=False)
     p.add_argument("--use_cuda_graph", action="store_true", default=False)
-    p.add_argument("--kv_cache_max_len", type=int, default=1024)
+    p.add_argument("--kv_cache_max_len", type=int, default=1024,
+                   help="0 = auto: size to max_prompt_len + gen_length (rounded "
+                        "to 64) per dataset. Every forward scans the WHOLE "
+                        "buffer, so the fixed 1024 wastes bandwidth on short "
+                        "prompts: draft denoise measures 35.7 ms/block at 1024 "
+                        "vs 31.2 ms at 256 (scripts/33_extend_probe.py).")
     p.add_argument("--draft_sampling", default="argmax",
                    choices=["argmax", "multinomial"])
     p.add_argument("--speculative_branch", default="greedy_match",
@@ -89,17 +146,46 @@ def main():
                         "single cuda_graph (saves 3x dispatch + Python loop "
                         "overhead). Requires argmax + low_confidence_static "
                         "+ no early-stop. Cached per n_known.")
+    p.add_argument("--fold_draft_extend", action="store_true", default=False,
+                   help="Fold the draft-side cache extend into the next fused "
+                        "denoise graph (one fewer draft forward per block). "
+                        "Requires --fused_denoise. See docs/optimize-extend.md.")
     p.add_argument("--speculative_target_extend", action="store_true", default=False,
                    help="Mirror the optimistic draft extend on the target "
                         "cache: speculatively extend target K/V before MRS "
                         "so target stream stays continuous (no idle wait "
                         "for MRS). Rolls back on reject like draft side.")
+    p.add_argument("--fused_linear", default="off",
+                   choices=("off", "draft", "target", "both"),
+                   help="Route nn.Linear through the fused split-K GEMV kernel "
+                        "(kernels/thin_linear_fused.py). At M=batch*block_length=4 "
+                        "cuBLAS leaves most SMs idle; see "
+                        "docs/kernel-optimization.md. Draft-side only by default "
+                        "because the target model is already near DRAM peak. "
+                        "NOT byte-identical to cuBLAS -- gate with "
+                        "scripts/37_fused_linear_quality.sh.")
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     draft_device = torch.device(args.draft_device)
     target_device = torch.device(args.target_device)
+    target_gpus = _parse_gpu_list(args.target_gpus)
+
+    if target_gpus:
+        if draft_device.index in target_gpus:
+            raise SystemExit(
+                f"--draft_device {args.draft_device} is inside --target_gpus "
+                f"{target_gpus}; the target would evict the draft. Give the "
+                f"draft a card of its own."
+            )
+        if args.use_cuda_graph:
+            raise SystemExit(
+                "--target_gpus (sharded target) cannot be combined with "
+                "--use_cuda_graph: capture would have to span accelerate's "
+                "cross-device copies, and StaticBlockCache puts every layer's "
+                "K/V on a single device."
+            )
 
     if args.pipeline:
         assert args.use_cuda_graph, "--pipeline requires --use_cuda_graph"
@@ -107,17 +193,42 @@ def main():
             "--pipeline requires draft_device != target_device"
     gen_fn = (speculative_generate_with_kv_cache_pipelined if args.pipeline
               else speculative_generate_with_kv_cache)
-    print(f"[init] draft={args.draft_device}  target={args.target_device}  "
+    print(f"[init] draft={args.draft_device}  "
+          f"target={target_gpus if target_gpus else args.target_device}  "
           f"use_cuda_graph={args.use_cuda_graph}  pipeline={args.pipeline}  "
           f"entry={gen_fn.__name__}", flush=True)
     torch.manual_seed(args.seed)
     t0 = time.time()
     print(f"[load] draft  {args.draft_model}", flush=True)
     draft_model, n_d = _load(args.draft_model, draft_device)
-    print(f"[load] target {args.target_model}", flush=True)
-    target_model, n_t = _load(args.target_model, target_device)
+    print(f"[load] target {args.target_model}"
+          f"{f' sharded over {target_gpus} @ {args.target_max_memory}' if target_gpus else ''}",
+          flush=True)
+    target_model, n_t = _load(args.target_model, target_device,
+                              shard_gpus=target_gpus,
+                              max_memory_per_gpu=args.target_max_memory)
     print(f"[load] done in {time.time()-t0:.1f}s  "
           f"(RMSNorm patched: draft={n_d}  target={n_t})", flush=True)
+    print(f"[place] draft  {_placement(draft_model)}", flush=True)
+    print(f"[place] target {_placement(target_model)}", flush=True)
+
+    # A sharded target's entry device is wherever accelerate put the embedding,
+    # not what --target_device said. Everything downstream derives devices from
+    # the model itself, so keep this in sync for the timing calls below.
+    target_device = next(target_model.parameters()).device
+    sharded = bool(getattr(target_model, "hf_device_map", None)) and len(
+        {str(v) for v in target_model.hf_device_map.values()}) > 1
+
+    if args.fused_linear != "off":
+        # Must happen before any CUDA graph capture: capture freezes whichever
+        # forward is installed at capture time.
+        from kernels import fused_toggle
+        for tag, m in (("draft", draft_model), ("target", target_model)):
+            if args.fused_linear in (tag, "both"):
+                n = fused_toggle.apply_to_model(m, True)
+                fused_toggle.warmup(m, block_length=args.block_length)
+                print(f"[fused_linear] {tag}: {n} nn.Linear -> split-K GEMV",
+                      flush=True)
 
     for m in (draft_model, target_model):
         if not hasattr(m.config, "block_size"):
@@ -143,6 +254,7 @@ def main():
         kv_cache_max_len=args.kv_cache_max_len,
         fused_denoise=args.fused_denoise,
         speculative_target_extend=args.speculative_target_extend,
+        fold_draft_extend=args.fold_draft_extend,
     )
 
     summary = {"runs": []}
@@ -151,14 +263,24 @@ def main():
             dataset=dataset, dataset_split="test", num_samples=args.num_samples,
         )
         ds, prompt_ids = load_prompts(tokenizer, ds_cfg)
-        print(f"\n[{dataset}] loaded {len(prompt_ids)} prompts", flush=True)
+        if args.kv_cache_max_len == 0:
+            need = max(len(x) for x in prompt_ids) + args.num_blocks * args.block_length
+            cfg.kv_cache_max_len = -(-need // 64) * 64
+        print(f"\n[{dataset}] loaded {len(prompt_ids)} prompts  "
+              f"kv_cache_max_len={cfg.kv_cache_max_len}", flush=True)
 
         results = []
         for i, pids in enumerate(prompt_ids):
             plen = len(pids)
             ev_start = torch.cuda.Event(enable_timing=True)
             ev_end = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize(target_device)
+            # Sharded: the work spans several devices, so an event pair on the
+            # entry device only brackets it if every device is idle at both
+            # ends. Sync all of them rather than just the entry one.
+            if sharded:
+                torch.cuda.synchronize()
+            else:
+                torch.cuda.synchronize(target_device)
             t_start = time.time()
             ev_start.record(stream=torch.cuda.current_stream(target_device))
             eos_ids_arg = [eos_id] if eos_id is not None else None
@@ -172,6 +294,8 @@ def main():
             else:
                 gen_ids, stats = ret
                 timing = None
+            if sharded:
+                torch.cuda.synchronize()
             ev_end.record(stream=torch.cuda.current_stream(target_device))
             ev_end.synchronize()
             gpu_ms = ev_start.elapsed_time(ev_end)

@@ -1,0 +1,130 @@
+# SDAR · latency 档 —— 历史口径的复现 + 全 kernel 优化栈
+#
+#   python run_protocol.py sdar_latency --arm ours         # sdp + 全优化
+#   python run_protocol.py sdar_latency --arm nat1         # 单卡 + CG
+#   python run_protocol.py sdar_latency --arm tp2cg        # 论文 Vanilla+CG 行
+#   python run_protocol.py sdar_latency --arm tp2van       # 论文 Vanilla 行
+#   python run_protocol.py sdar_latency --arm both         # = default_arms，串行
+#
+# 这一份**复现历史口径**（docs/theoretical-speedup.md §5、docs/kernel-optimization.md、
+# docs/optimize-extend.md），因此与 llada2_latency 有意不同：
+#
+#   * runner 按 arm 不同：ours 走 run_ours_dual_gpu.py，三个 baseline 走
+#     *_tp2_cache.py + torchrun。这是那几个数字的实际来源，不能统一。
+#   * prompt 是 **repo 手写的**，不是 OpenCompass —— run_ours_dual_gpu.py 只有
+#     load_prompts()，没有 --prompts/--shuffle_seed/--mmlu_style。所以这一档的
+#     数字**不能**与 sdar_quality / llada2_latency 横向比（prompt 长度差一个量级）。
+#   * 定长用 --num_blocks 表达（bl=4 -> 32 块 = 128 token），不是 --gen_length。
+#   * gsm8k 单数据集、N=20：这是逐阶段 breakdown 的口径，不是 benchmark 口径。
+#
+# 历史基准（bl=4，gsm8k，空闲节点）:
+#   tp2van  9.1   Vanilla TP=2 无 CG      （论文 Vanilla 行）
+#   tp2cg  50.1   Vanilla TP=2 + CG       （论文 Vanilla+CG 行）
+#   nat1   40.9   单卡 + CG
+#   sd2    56.2   ours 双卡无流水
+#   sdp    58.3   ours 双卡 + 流水        ← 优化前
+#   79.0   + pinned staging + kv 自动定尺
+#   91.2   + fold_draft_extend           （extend 窗口 7.69 -> 0.12 ms）
+#   90.0   + fused_linear draft（对 79.0 测的，ρ 0.470 -> 0.387）
+#
+# ⚠ ours 这个 arm 同时开了 fold_draft_extend 和 fused_linear draft，而**这两项的
+#   叠加效果尚未实测**（docs/kernel-optimization.md §8 第 1 条：kernel 是对 79.0
+#   测的、fold 是对 91.2 测的，两项都改 draft 流，收益不应简单相加）。跑出来的数
+#   就是这个缺口的答案，别预设它等于 91.2 或 90.0。
+#
+# ⚠ fused_linear 不是逐位等价于 cuBLAS。n=20 strict 门禁下文本 20/20 相同、
+#   α 不变（0.8955），但 N=200 的统计门禁还没跑
+#   （scripts/37_fused_linear_quality.sh，MODE=quality）。
+#
+# ⚠ 两个 TP baseline 各自保留自己的采样口径：tp2van = multinomial + dynamic
+#   remasking，tp2cg = argmax + static。那是论文两行 baseline 的定义，
+#   强行统一就复现不出 9.1 / 50.1。
+#
+# ⚠ 手工 torchrun 跑 *_tp2_cache.py 在写完 SUMMARY 后会卡在
+#   dist.destroy_process_group()（NCCL + cuda_graph 拆解死锁），永远占卡。
+#   本入口没有 watchdog —— 跑完记得核对进程，别留僵尸。
+
+name: sdar_latency
+family: sdar
+mode: latency
+note: 历史 breakdown 口径（repo prompt、gsm8k、N=20）+ 全 kernel 优化栈；数字不与其他档横向比
+
+checkpoints:
+  4:
+    target: JetLM/SDAR-8B-Chat
+    draft: ./models/SDAR-1_7B-Chat
+  8:
+    target: JetLM/SDAR-8B-Chat-b8
+    draft: JetLM/SDAR-1.7B-Chat-b8
+
+fixed_tokens: 128           # num_blocks = 128 / bl（bl=4 -> 32，bl=8 -> 16）
+default_arms: [nat1, tp2cg, ours]
+
+arms:
+  # ── ours：全优化栈 ──
+  ours:
+    runner: main_table/run_ours_dual_gpu.py
+    needs_draft: true
+    draft_device: cuda:0
+    target_device: cuda:1
+    args:
+      use_cuda_graph: true
+      pipeline: true                  # 双卡流水，两侧都能 capture
+      fused_denoise: true             # ds 步融进一张图
+      fold_draft_extend: true         # draft 侧 extend 折进下一次去噪（需 fused_denoise）
+      speculative_target_extend: true # target 侧乐观 extend，流不空转
+      fused_linear: draft             # split-K GEMV kernel；target 已近 DRAM 峰值故不开
+      kv_cache_max_len: 0             # 0 = 自动定尺（每次前向扫整个 buffer，超尺白烧带宽）
+      return_timings: true            # 逐阶段 breakdown 才是这一档的主要产物
+      remasking_strategy: low_confidence_static
+      draft_sampling: argmax
+      speculative_branch: greedy_match
+      partial_block_fill: truncate
+      mrs_verify_order: position
+
+  # ── baseline：单卡 + CG ──
+  nat1:
+    runner: main_table/run_native_tp2_cache.py
+    torchrun: 1                       # nproc=1：同一个 runner，退化成单卡
+    gpus: 1
+    args:
+      use_cuda_graph: true
+      breakdown: true
+      # remasking / sampling 不传，用 runner 默认（argmax + static）
+
+  # ── baseline：论文 Vanilla + CG 行（TP=2）──
+  tp2cg:
+    runner: main_table/run_native_tp2_cache.py
+    torchrun: 2
+    gpus: 2
+    args:
+      use_cuda_graph: true
+      breakdown: true
+      # remasking / sampling 不传：该 runner 的 argparse 默认就是 argmax + static
+
+  # ── baseline：论文 Vanilla 行（TP=2，无 CG）──
+  tp2van:
+    runner: main_table/run_vanilla_tp2_cache.py
+    torchrun: 2
+    gpus: 2
+    args:
+      breakdown: true
+      # 不传采样/remasking：该 runner 的 argparse 默认就是
+      # multinomial + low_confidence_dynamic，那正是论文 Vanilla 行的定义。
+
+# 所有 arm 共用 —— 只放三个 runner 都接受的参数。
+# 采样与 remasking 故意**不**放在这里：两个 TP baseline 的 argparse 默认值就是它们
+# 各自的固有口径（vanilla = multinomial + low_confidence_dynamic，native = argmax +
+# low_confidence_static），传进去反而会覆盖掉。而 speculative_branch /
+# partial_block_fill 这两个 flag 它们根本不接受，传了直接 argparse 报错。
+args:
+  mask_token_id: 151669
+  seed: 42
+  block_length: 4                     # 被 --bl 覆盖；ds 与 num_blocks 跟着变
+  denoising_steps: 4
+  num_blocks: 32                      # = fixed_tokens / bl，由入口重算
+  no_eos_stop: true                   # 定长
+  num_samples: 20                     # breakdown 口径
+  datasets: [gsm8k]
+
+output_dir: runs/protocol/sdar_latency

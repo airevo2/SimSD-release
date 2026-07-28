@@ -1,0 +1,88 @@
+# LLaDA2 bring-up experiment — eager, self-draft.
+#
+#   python main.py --experiment configs/experiments/llada2.yaml
+#
+# This is deliberately not the headline configuration. It is the setting that
+# answers "does the SimSD pipeline run at all on LLaDA2", and it is pinned to
+# the two constraints the family imposes today:
+#
+#   1. EAGER ONLY. LLaDA2MoeSparseMoeBlock.moe_infer does
+#      tokens_per_expert.cpu().numpy() and loops over 256 experts in Python.
+#      The host sync forbids torch.cuda.graph capture, so use_cuda_graph is
+#      false here and the adapter raises rather than fail inside capture.
+#      Because the gate is global, the `vanilla_cg` method would collapse onto
+#      `vanilla`, so it is left out of `methods`.
+#   2. SELF-DRAFT. draft == target == LLaDA2.0-mini, which makes this a
+#      correctness harness rather than a speedup measurement: with one model in
+#      both roles the acceptance rate must come out at ~1.0 and the output must
+#      match target-only decoding token for token. Anything else is an adapter
+#      bug, not an algorithmic result. `scripts/llada2_selfdraft_check.py` runs
+#      exactly that assertion in-process on a single GPU; this file runs the
+#      same pair through the full benchmark harness so the numbers land in
+#      SUMMARY.json.
+#
+# For the real pair once bring-up passes (needs ~4 cards for the 100B target,
+# 191.6 GiB in bf16, plus device_map sharding support in the runner):
+#     models:
+#       target: inclusionAI/LLaDA2.0-flash    # 100B total / 6.1B activated
+#       draft:  inclusionAI/LLaDA2.0-mini     #  16B total / 1.4B activated
+# Same tokenizer on both (vocab 157184, byte-identical tokenizer.json), so
+# draft and target token ids are directly comparable — no vocab mapping.
+
+name: llada2-mini-selfdraft-eager
+family: llada2
+
+models:
+  target: inclusionAI/LLaDA2.0-mini
+  draft: inclusionAI/LLaDA2.0-mini
+
+tokens:
+  # LLaDA2MoeModelLM.generate defaults: mask_id=156895, eos_id=156892.
+  # Shared by mini and flash.
+  mask_token_id: 156895
+
+block:
+  # Upstream recommends block_length=32 / steps=32 / threshold=0.95 /
+  # temperature=0. Kept here so the denoise schedule matches how the model was
+  # tuned; the block-length sweep is a separate experiment.
+  block_length: 32
+  denoising_steps: 32
+
+data:
+  datasets: [gsm8k]
+  num_samples: 5
+
+methods: [ours]
+modes: [quality]
+
+mode_settings:
+  quality:
+    num_blocks: 4       # 4 x 32 = 128 token budget, EOS stop on
+
+runtime:
+  gpus: "0"
+  draft_device: cuda:0    # same card: self-draft, one checkpoint copy per role
+  target_device: cuda:0
+  use_cuda_graph: false   # see (1) above
+  pipeline: false         # needs cuda_graph + two distinct devices
+  fused_denoise: false    # cuda_graph-only optimisation
+  speculative_target_extend: false
+  return_timings: true    # eager stage breakdown is the useful signal here
+  seed: 42
+
+spec:
+  # Upstream's generate() unmasks every position whose confidence clears
+  # `threshold` and falls back to the top-k schedule otherwise — that is
+  # exactly low_confidence_dynamic at threshold 0.95, with temperature 0
+  # (= argmax).
+  draft_sampling: argmax
+  remasking_strategy: low_confidence_dynamic
+  confidence_threshold: 0.95
+
+method_spec:
+  ours:
+    speculative_branch: greedy_match   # argmax on both sides → greedy rule
+    mrs_verify_order: position
+    partial_block_fill: truncate
+
+output_dir: runs/llada2_selfdraft
