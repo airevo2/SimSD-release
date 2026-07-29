@@ -79,3 +79,49 @@ runs/
 # Datasets / rollouts
 data/
 *.jsonl
+
+# Kernel tuning workspace: untracked by default, with the correctness gate
+# explicitly allowed back in.
+#
+# Excluded for two reasons:
+#   * oracle/*.pt is 44 GB (flash_T32_fp32.pt alone is 12 GB -- it holds all 256
+#     experts' weights). Regenerable, see below.
+#   * report.html / plan.md / draft.md / benchmark*.csv / duipai_*.csv /
+#     profile.ncu-rep are tuning residue. The ncu-rep is also a binary tied to the
+#     GPU it was captured on (SM 12.0 here), so it means nothing elsewhere.
+#
+# Allowed back in because the production kernels (kernels/*.py) do not import
+# workspace -- it is not a runtime dependency -- but it is the entire basis of the
+# kernel's VERIFIABILITY. Without duipai.py + build_oracle.py +
+# oracle/manifest.jsonl, moe_dispatch_fused.py becomes a kernel you can only
+# trust, never check; and it is not an ordinary optimisation (fused MoE moved
+# alpha from 0.761 to 0.556, because draft and target each flip tokens
+# independently). CONTRACT.md pins the training/inference mode and is required
+# reading before touching the kernel.
+#
+# Rebuilding the oracle, from the repo root:
+#     python kernels/workspace/<kernel>/build_oracle.py
+# manifest.jsonl records each fixture's T/k/E/H/I/dtype/scale/concentration.
+kernels/workspace/**
+# Directories must be allowed back first, or git never descends into them and
+# every ! below is dead.
+!kernels/workspace/**/
+!kernels/workspace/__init__.py
+!kernels/workspace/*/__init__.py
+!kernels/workspace/*/CONTRACT.md
+!kernels/workspace/*/build_oracle.py
+!kernels/workspace/*/duipai.py
+!kernels/workspace/*/verify_model.py
+!kernels/workspace/*/oracle/manifest.jsonl
+
+# Local-only.
+#   docs/     result write-ups and the HTML tables (rolling intermediate findings)
+#   models/   local checkpoint copies (SDAR-1_7B-Chat etc., fetched from HF)
+#   scripts/  orchestration and sweep drivers
+# run_protocol.py and configs/protocol/*.yaml are NOT here -- they are the entry
+# point and the single source of truth for the calibrated settings, so both are
+# tracked. scripts/env.sh is inlined into run_protocol.py's ENV_DEFAULTS, so the
+# entry point does not depend on scripts/.
+docs/
+models/
+scripts/

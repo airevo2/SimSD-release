@@ -1,0 +1,81 @@
+# L2 — levers 1 + 2: cheaper draft schedule on top of the tail fill.
+#
+#   python main.py -e configs/experiments/llada2_flash_draft.yaml
+#
+# Lever 1 attacks the 69% of wall-clock the draft ate in L0 (1250 ms/block
+# against the target side's 558 ms).
+#
+# Why the draft is that expensive. Under `low_confidence_dynamic` a step commits
+# every position whose confidence clears the threshold, and falls back to top-1
+# otherwise. flash clears 0.95 often, so the baseline commits several tokens per
+# forward — that is LLaDA2's own parallel decoding, and it is what makes the
+# baseline hard to beat. mini rarely clears 0.95, so the draft degenerates to
+# ~1 token per forward and runs the full 32 steps per block. Lowering the
+# threshold *for the draft only* lets it commit several positions per step too.
+#
+# Note the knob is already per-role: in the `ours` path confidence_threshold
+# only ever reaches the draft (target verify is one forward, no denoising).
+# Putting it in method_spec.ours rather than the shared `spec:` block is what
+# keeps the baseline's schedule pinned at 0.95.
+#
+# The trade is explicit: a lower threshold means the draft proposes tokens it is
+# less sure of, so alpha should fall. The question the run answers is whether
+# the forwards saved outweigh the acceptances lost — draft_s per block and alpha
+# are both in the breakdown, so the two effects can be read separately rather
+# than inferred from tok/s.
+#
+# 0.80 is a first probe, not a tuned value. If alpha holds up, 0.5 is the next
+# point; if it collapses, `draft_steps_per_block` (a hard cap on draft steps,
+# with the target's argmax filling the positions the draft never reached) is the
+# more surgical version of the same idea — it needs a flag on
+# run_ours_dual_gpu.py, which this config deliberately avoids.
+
+name: llada2-flash-cheap-draft
+family: llada2
+
+models:
+  target: inclusionAI/LLaDA2.0-flash
+  draft: inclusionAI/LLaDA2.0-mini
+
+tokens:
+  mask_token_id: 156895
+
+block:
+  block_length: 32
+  denoising_steps: 32
+
+data:
+  datasets: [gsm8k]
+  num_samples: 50
+
+methods: [ours]
+modes: [quality]
+
+mode_settings:
+  quality:
+    num_blocks: 8
+
+runtime:
+  gpus: "0,1,2,3,4"
+  draft_device: cuda:0
+  target_gpus: [1, 2, 3, 4]
+  target_max_memory: 88GiB
+  use_cuda_graph: false
+  pipeline: false
+  fused_denoise: false
+  speculative_target_extend: false
+  return_timings: true
+  seed: 42
+
+spec:
+  draft_sampling: argmax
+  remasking_strategy: low_confidence_dynamic
+
+method_spec:
+  ours:
+    speculative_branch: greedy_match
+    mrs_verify_order: position
+    partial_block_fill: target_argmax
+    confidence_threshold: 0.80   # <- draft only; baseline stays at 0.95
+
+output_dir: runs/llada2_flash_draft

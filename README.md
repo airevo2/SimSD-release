@@ -61,12 +61,53 @@ python main.py
 That single command runs all three methods (`vanilla` / `vanilla_cg` / `ours`)
 × {`latency`, `quality`} over four datasets (`gsm8k`, `mbpp`, `triviaqa`,
 `mmlu`) at N=200, writes per-job `SUMMARY.json` plus a top-level
-`UNIFIED.json`, and prints a unified results table at the end. Defaults
-already point at the HuggingFace checkpoints
-(`JetLM/SDAR-8B-Chat` + `JetLM/SDAR-1.7B-Chat`), GPUs `0,1`, and the
-optimized `ours` config (fused denoise + speculative target extend +
-truncate + greedy-match). Throughput is computed from `torch.cuda.Event`
-(not wall clock).
+`UNIFIED.json`, and prints a unified results table at the end. Throughput is
+computed from `torch.cuda.Event` (not wall clock).
+
+The settings come from `configs/experiments/sdar.yaml`, which `main.py` reads by
+default — HuggingFace checkpoints (`JetLM/SDAR-8B-Chat` +
+`JetLM/SDAR-1.7B-Chat`), GPUs `0,1`, and the optimized `ours` config (fused
+denoise + speculative target extend + truncate + greedy-match). Every value is
+overridable on the CLI:
+
+```bash
+python main.py -e configs/experiments/sdar.yaml --num_samples 20 --datasets gsm8k
+python main.py -e <file> --print_config      # resolved settings + the exact commands
+```
+
+## 3. Other model families
+
+Family-specific knowledge lives in `speculative_decoding/adapters/`; the adapter
+is chosen by inspecting the loaded checkpoint, not by a flag. Adding a family
+means adding one module there.
+
+```bash
+# LLaDA2.0-mini against itself — correctness harness for the pipeline
+python main.py -e configs/experiments/llada2.yaml
+
+# mini drafts, flash verifies (flash sharded over 4 GPUs)
+python main.py -e configs/experiments/llada2_flash.yaml
+
+# upstream generate() vs SimSD native vs self-draft, in one process
+python scripts/llada2_selfdraft_check.py --dtype float32
+```
+
+Two LLaDA2 constraints are encoded in the configs rather than left to be
+rediscovered:
+
+- **Eager only.** `LLaDA2MoeSparseMoeBlock.moe_infer` does
+  `tokens_per_expert.cpu().numpy()` and loops over 256 experts in Python, so
+  nothing can be captured into a cuda_graph. The adapter raises with that
+  explanation instead of failing inside capture.
+- **Sharded target.** LLaDA2.0-flash is 191.6 GiB in bf16, so the TP=2 baselines
+  would need 95.8 GiB/rank against 95.6 GiB of usable HBM — it misses by a hair.
+  `runtime.target_gpus` spreads it over several cards instead
+  with `device_map="auto"`. That is *naive* model parallelism, not tensor
+  parallelism and not pipeline parallelism either — layers are placed across
+  devices but a single input runs through them strictly in order, so one GPU is
+  busy at a time. It buys capacity, not speed. Compare against
+  `native_sharded`, which places the target identically, rather than against a
+  TP run; otherwise a placement difference gets attributed to speculation.
 
 ---
 

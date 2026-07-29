@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import Cache, DynamicCache
 
+from speculative_decoding import adapters
 from speculative_decoding.mrs import mrs_verify, greedy_match_verify
 
 
@@ -146,8 +147,33 @@ except ImportError:  # torch < 2.3 fallback
 
 MASK_TOKEN_ID_DEFAULT = 151669
 
+# Which attention forward is currently installed on each attention class.
+# One registry, not one set per mode: all three patch functions
+# (static / eager / cache-free eval) write the SAME ``cls.forward``, so
+# per-mode sets let a later patch silently overwrite an earlier one while the
+# earlier mode still believes it is installed. A process that exercised both
+# paths on one model class then ran the wrong forward — q with H_q heads
+# against k with H_kv heads. Keyed by class; values are "static" | "eager" |
+# "eval".
+_ATTN_PATCH_MODE: Dict[Any, str] = {}
+
+# Back-compat aliases; membership is derived from the registry above.
 _PATCHED_ATTN_CLASSES = set()
 _PATCHED_STATIC_ATTN_CLASSES = set()
+
+
+def _install_attn_forward(attn_cls, mode: str, make_fn) -> bool:
+    """Install ``mode``'s forward on ``attn_cls`` if a different one is live.
+
+    Returns True when a (re)patch happened.
+    """
+    if _ATTN_PATCH_MODE.get(attn_cls) == mode:
+        return False
+    attn_cls.forward = make_fn()
+    _ATTN_PATCH_MODE[attn_cls] = mode
+    (_PATCHED_STATIC_ATTN_CLASSES if mode == "static"
+     else _PATCHED_ATTN_CLASSES).add(attn_cls)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -272,8 +298,112 @@ class StaticBlockCache(Cache):
             v.zero_()
 
 
+#: (id(model), role) pairs whose graph decision has already been logged. The
+#: decision is a property of the model, not of the request, but it is resolved
+#: per generate() call -- without this, a 200-sample run prints the same two
+#: lines 200 times and buries everything else in the log.
+_GRAPH_DECISION_LOGGED: set = set()
+
+
+def _log_graph_decision(role: str, model, msg: str) -> None:
+    key = (id(model), role)
+    if key in _GRAPH_DECISION_LOGGED:
+        return
+    _GRAPH_DECISION_LOGGED.add(key)
+    print(msg, flush=True)
+
+
+def graph_capability(model) -> Tuple[bool, str]:
+    """Whether this model *instance* can run the cuda_graph path.
+
+    Returns ``(ok, reason)``; ``reason`` is non-empty exactly when ``ok`` is
+    False and is written to be shown to the user. Two callers differ only in
+    what they do with it: ``patch_sdpa_static_cache`` raises (the caller asked
+    for capture explicitly), ``resolve_graph_roles`` falls back to eager for
+    that role alone.
+
+    Capturability is a property of the instance, not the family — for LLaDA2 it
+    depends on whether the grouped-GEMM MoE dispatch has replaced the stock
+    ``moe_infer`` (which syncs on the host), and on whether accelerate spread
+    the weights over more than one device.
+    """
+    adapter = adapters.detect(model)
+    if adapter is None:
+        return False, ("no SimSD adapter recognises this model, so its "
+                       "attention forward cannot be replaced")
+    blocker = adapter.graph_blocker(model)
+    if blocker:
+        return False, f"model family {adapter.family!r} cannot be captured: {blocker}"
+    if adapters.is_sharded(model):
+        return False, (
+            "sharded across devices (hf_device_map spans >1 GPU): capture would "
+            "have to span accelerate's cross-device copies, and StaticBlockCache "
+            "allocates every layer's K/V on one device"
+        )
+    return True, ""
+
+
+def resolve_graph_roles(draft_model, target_model, want_graph: bool,
+                        verbose: bool = True) -> Tuple[bool, bool]:
+    """Decide *per role* whether to run the cuda_graph path.
+
+    ``use_cuda_graph`` used to be a single switch over both models, so the role
+    that could not be captured set the mode for both. On LLaDA2 that is
+    expensive in one direction only: the 191.6 GiB flash target must be sharded
+    across 4 GPUs (uncapturable), and that dragged the 30.3 GiB mini draft onto
+    the eager path as well — while the draft is ~81% of a block's wall clock and
+    gains 2.7x from capture (27.48 -> 10.11 ms/forward).
+
+    Mixing modes is safe because every piece of per-forward state is already
+    per model: the K/V cache object, the prefill, and the denoise / verify /
+    extend entry points all take a model plus its own cache. The one thing that
+    is *not* per model is the patched attention forward, which is installed on
+    the attention CLASS (``_install_attn_forward``). So mixing is refused when
+    both roles resolve to the same class object — self-draft, or two checkpoints
+    that happen to share one dynamic module — because the second patch would
+    silently overwrite the first.
+
+    Returns ``(draft_graph, target_graph)``.
+    """
+    if not want_graph:
+        return False, False
+
+    d_ok, d_why = graph_capability(draft_model)
+    t_ok, t_why = graph_capability(target_model)
+    if d_ok and t_ok:
+        return True, True
+
+    d_adapter = adapters.detect(draft_model)
+    t_adapter = adapters.detect(target_model)
+    d_cls = d_adapter.find_attn_class(draft_model) if d_adapter else None
+    t_cls = t_adapter.find_attn_class(target_model) if t_adapter else None
+    shared_class = (draft_model is target_model) or (
+        d_cls is not None and d_cls is t_cls
+    )
+    if shared_class:
+        why = d_why or t_why
+        if verbose:
+            _log_graph_decision(
+                "shared", draft_model,
+                "[cuda_graph] both roles share one attention class "
+                f"({getattr(d_cls, '__name__', '?')}), so they cannot run "
+                f"different modes -> eager for both. Reason: {why}",
+            )
+        return False, False
+
+    if verbose:
+        for role, model, ok, why in (("draft", draft_model, d_ok, d_why),
+                                     ("target", target_model, t_ok, t_why)):
+            _log_graph_decision(
+                role, model,
+                f"[cuda_graph] {role}: captured" if ok
+                else f"[cuda_graph] {role}: eager ({why})",
+            )
+    return d_ok, t_ok
+
+
 def patch_sdpa_static_cache(model) -> bool:
-    """Replace SDARAttention.forward with an SDPA path that uses
+    """Replace the family's attention forward with an SDPA path that uses
     StaticBlockCache's fixed-shape buffers via in-place ``index_copy_``.
 
     The patched forward expects:
@@ -286,127 +416,29 @@ def patch_sdpa_static_cache(model) -> bool:
       - ``attention_mask``: bool mask of shape
         (1, 1, cur_len, full_len)  caller masks invalid cache positions.
 
+    The forward body lives in ``adapters.base.make_static_cache_forward``; which
+    projections it reads comes from the adapter detected on ``model``.
+
     Idempotent. Returns True if a patch was applied.
     """
-    import sys
-
-    attn_cls = None
-    for m in model.modules():
-        if m.__class__.__name__ == "SDARAttention":
-            attn_cls = m.__class__
-            break
-    if attn_cls is None:
+    adapter = adapters.detect(model)
+    if adapter is None:
         return False
-    if attn_cls in _PATCHED_STATIC_ATTN_CLASSES:
-        return False
+    attn_cls = adapter.find_attn_class(model)
+    ok, why = graph_capability(model)
+    if not ok:
+        raise RuntimeError(
+            f"cannot install the cuda_graph attention path on this model: {why}. "
+            f"Run eager (use_cuda_graph: false)."
+        )
 
-    apply_rotary_pos_emb = sys.modules[attn_cls.__module__].apply_rotary_pos_emb
-
-    def _sdpa_static_forward(self, hidden_states, position_embeddings,
-                             attention_mask, past_key_value=None,
-                             cache_position=None, **kwargs):
-        from einops import rearrange
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        k_new = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        v_new = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        q, k_new = apply_rotary_pos_emb(q, k_new, cos, sin)
-
-        # Caller passes scratch positions via kwargs (graph-stable input).
-        cur_scratch_pos = kwargs.get("cur_scratch_pos")
-        store_kv = bool(kwargs.get("store_kv", False))
-
-        if past_key_value is not None and cur_scratch_pos is not None:
-            gqa_mode = getattr(past_key_value, "gqa_mode", "expand")
-            n_rep = past_key_value.n_rep
-            if gqa_mode == "native":
-                # H_kv-wide cache: write k_new (H_kv) directly, no expansion.
-                # SDPA below will broadcast Q (H_q) via enable_gqa=True.
-                past_key_value.key_cache[self.layer_idx].index_copy_(
-                    2, cur_scratch_pos, k_new,
-                )
-                past_key_value.value_cache[self.layer_idx].index_copy_(
-                    2, cur_scratch_pos, v_new,
-                )
-                if store_kv and cache_position is not None:
-                    past_key_value.key_cache[self.layer_idx].index_copy_(
-                        2, cache_position, k_new,
-                    )
-                    past_key_value.value_cache[self.layer_idx].index_copy_(
-                        2, cache_position, v_new,
-                    )
-            elif n_rep == 1:
-                # H_q == H_kv (no GQA): single-slot write.
-                past_key_value.key_cache[self.layer_idx].index_copy_(
-                    2, cur_scratch_pos, k_new,
-                )
-                past_key_value.value_cache[self.layer_idx].index_copy_(
-                    2, cur_scratch_pos, v_new,
-                )
-                if store_kv and cache_position is not None:
-                    past_key_value.key_cache[self.layer_idx].index_copy_(
-                        2, cache_position, k_new,
-                    )
-                    past_key_value.value_cache[self.layer_idx].index_copy_(
-                        2, cache_position, v_new,
-                    )
-            else:
-                # GQA-expand on write: H_q-wide cache, k_new strided across n_rep slots.
-                for i in range(n_rep):
-                    past_key_value.key_cache[self.layer_idx][:, i::n_rep, :, :].index_copy_(
-                        2, cur_scratch_pos, k_new,
-                    )
-                    past_key_value.value_cache[self.layer_idx][:, i::n_rep, :, :].index_copy_(
-                        2, cur_scratch_pos, v_new,
-                    )
-                if store_kv and cache_position is not None:
-                    for i in range(n_rep):
-                        past_key_value.key_cache[self.layer_idx][:, i::n_rep, :, :].index_copy_(
-                            2, cache_position, k_new,
-                        )
-                        past_key_value.value_cache[self.layer_idx][:, i::n_rep, :, :].index_copy_(
-                            2, cache_position, v_new,
-                        )
-            full_k = past_key_value.key_cache[self.layer_idx]
-            full_v = past_key_value.value_cache[self.layer_idx]
-        else:
-            gqa_mode = "expand"
-            # Fallback no-cache path (shouldn't be reached in cache-aware spec).
-            full_k = k_new
-            full_v = v_new
-
-        mask_bool = attention_mask.bool() if attention_mask is not None else None
-        # In "expand" mode head counts match  SDPA picks EFFICIENT_ATTENTION
-        # for free (~1.8× faster than MATH GQA on Blackwell).
-        # In "native" mode K/V is H_kv-wide  enable_gqa=True so Q broadcasts;
-        # SDPA falls back to MATH (mirror of the eager `patch_sdpa_with_cache`
-        # path, kept available so we can ablate the GQA-expansion optimization).
-        if gqa_mode == "native":
-            attn_output = F.scaled_dot_product_attention(
-                query=q, key=full_k, value=full_v,
-                attn_mask=mask_bool,
-                is_causal=False,
-                scale=self.scaling,
-                enable_gqa=True,
-            )
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query=q, key=full_k, value=full_v,
-                attn_mask=mask_bool,
-                is_causal=False,
-                scale=self.scaling,
-            )
-        attn_output = rearrange(attn_output, "b h l d -> b l (h d)")
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None
-
-    attn_cls.forward = _sdpa_static_forward
-    _PATCHED_STATIC_ATTN_CLASSES.add(attn_cls)
-    return True
+    first = _install_attn_forward(
+        attn_cls, "static",
+        lambda: adapters.make_static_cache_forward(adapter, attn_cls))
+    # Unconditional: the class patch is idempotent, but *this* model's instances
+    # may still carry accelerate's forward shadow (see rebind_hooked_forwards).
+    adapters.rebind_hooked_forwards(model, attn_cls)
+    return first
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -552,6 +584,59 @@ def _replay_static_forward(entry: Dict[str, Any],
         entry["cache_position"].copy_(cache_position)
     entry["graph"].replay()
     return entry["logits"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Pinned staging for graph inputs
+# ─────────────────────────────────────────────────────────────────────
+# `torch.tensor(python_list, device=cuda)` stages through PAGEABLE host memory,
+# which makes the H2D copy SYNCHRONOUS: the host blocks until the destination
+# stream has drained. In the pipelined loop that turned a 32-byte token-id upload
+# into a multi-millisecond stall — `_extend_cache_graph(target_model, ...)` was
+# measured blocking the CPU for 18.1 ms (probe: scripts/33_extend_probe.py),
+# because the target stream still had the verify forward queued. The draft GPU
+# sat idle for that whole window even though its own extend took 9.1 ms.
+#
+# Staging through a per-buffer pinned tensor keeps the copy asynchronous, so the
+# host returns immediately and the draft stream can proceed to the next denoise.
+_PINNED_STAGE: Dict[Tuple[Any, ...], List[Tuple[torch.Tensor, torch.cuda.Event]]] = {}
+_PINNED_RING = 4
+
+
+def _fill_async_(dst: torch.Tensor, values: List[int]) -> None:
+    """``dst.copy_(values)`` without a blocking pageable H2D.
+
+    ``dst`` MUST be a long-lived buffer (a CUDA-graph static input): the pinned
+    ring is keyed by ``dst.data_ptr()``, so calling this on freshly allocated
+    tensors would allocate a new ring every call and never reuse one.
+    ``values`` is a flat host list whose length matches ``dst.numel()``.
+
+    Reusing one staging buffer would race: the host can overwrite it while the
+    previous async copy is still in flight. Each destination therefore gets a
+    small ring of pinned buffers, and a slot is only rewritten after the event
+    recorded on its last copy has completed. The pipelined loop syncs on
+    ``target_probs.cpu()`` every block, so the host is never more than about one
+    block ahead and the guard essentially never waits.
+    """
+    n = dst.numel()
+    key = (dst.data_ptr(), n)
+    ring = _PINNED_STAGE.get(key)
+    if ring is None:
+        ring = [(torch.empty(n, dtype=dst.dtype, device="cpu", pin_memory=True),
+                 torch.cuda.Event()) for _ in range(_PINNED_RING)]
+        _PINNED_STAGE[key] = ring
+    idx = _PINNED_SLOT.get(key, 0)
+    stage, done = ring[idx]
+    if not done.query():
+        done.synchronize()
+    for i, v in enumerate(values):          # tiny (<= 2 * block_length) writes
+        stage[i] = v
+    dst.view(-1).copy_(stage, non_blocking=True)
+    done.record()
+    _PINNED_SLOT[key] = (idx + 1) % _PINNED_RING
+
+
+_PINNED_SLOT: Dict[Tuple[Any, ...], int] = {}
 
 
 def _build_iter_attn_mask(cache: StaticBlockCache,
@@ -762,10 +847,28 @@ def _capture_fused_denoise_graph(
     cache: StaticBlockCache,
     device: torch.device,
     mask_token_id: int,
+    prefix_len: int = 0,
 ) -> Optional[Dict[str, Any]]:
+    """Fuse the ``ds`` denoise forwards of one block into a single graph.
+
+    ``prefix_len > 0`` additionally folds the *previous* block's cache extend
+    into this graph: the query window is widened to ``prefix_len + block_length``
+    and captured with ``store_kv=True``, so the leading (already committed)
+    tokens get re-encoded into the permanent cache for free. At this scale a
+    forward is weight-bandwidth bound, so doubling the query width costs almost
+    nothing while it removes one whole draft forward per block
+    (see docs/optimize-extend.md).
+
+    The leading segment's K/V depend only on the prefix and itself, so writing
+    them on every one of the ``ds`` internal forwards is idempotent. The trailing
+    (still denoising) segment writes into the slots it will eventually occupy —
+    garbage for now, but ``ctx_aligned`` has not advanced there yet so the mask
+    never exposes it, and the next fold overwrites it with the committed values.
+    """
     n_masks = block_length - n_known
     if n_masks <= 0:
         return None
+    width = prefix_len + block_length
 
     n_unmask_per_step: List[int] = []
     rem = n_masks
@@ -782,16 +885,16 @@ def _capture_fused_denoise_graph(
     vocab = model.config.vocab_size
 
     static_input_ids = torch.full(
-        (B, block_length), mask_token_id, dtype=torch.long, device=device,
+        (B, width), mask_token_id, dtype=torch.long, device=device,
     )
     static_position_ids = torch.zeros(
-        (B, block_length), dtype=torch.long, device=device,
+        (B, width), dtype=torch.long, device=device,
     )
     static_attn_mask = torch.zeros(
-        (B, 1, block_length, full_len), dtype=torch.bool, device=device,
+        (B, 1, width, full_len), dtype=torch.bool, device=device,
     )
     static_cur_scratch_pos = torch.arange(
-        cache.max_cache_len, cache.max_cache_len + block_length,
+        cache.max_cache_len, cache.max_cache_len + width,
         dtype=torch.long, device=device,
     )
     static_cache_position = static_cur_scratch_pos.clone()
@@ -808,22 +911,25 @@ def _capture_fused_denoise_graph(
                 position_ids=static_position_ids,
                 past_key_values=cache,
                 use_cache=True,
-                store_kv=False,
+                store_kv=(prefix_len > 0),
                 cur_scratch_pos=static_cur_scratch_pos,
                 cache_position=static_cache_position,
                 return_dict=True,
             )
-            logits = out.logits[0]
+            # Denoising only touches the trailing block; the leading prefix_len
+            # positions are along for the ride so their K/V get stored.
+            logits = out.logits[0, prefix_len:]
+            cur_ids = static_input_ids[0, prefix_len:]
             probs = F.softmax(logits.float(), dim=-1)
             pred_ids = probs.argmax(dim=-1)
             confidence = probs.gather(1, pred_ids.unsqueeze(-1)).squeeze(-1)
-            is_masked = (static_input_ids[0] == mask_token_id)
+            is_masked = (cur_ids == mask_token_id)
             masked_conf = torch.where(
                 is_masked, confidence,
                 torch.full_like(confidence, float("-inf")),
             )
             _, top_pos = masked_conf.topk(n_u)
-            static_input_ids[0].scatter_(0, top_pos, pred_ids.gather(0, top_pos))
+            cur_ids.scatter_(0, top_pos, pred_ids.gather(0, top_pos))
             static_step_map.scatter_(
                 0, top_pos, torch.full_like(top_pos, step_i),
             )
@@ -837,7 +943,7 @@ def _capture_fused_denoise_graph(
         s.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(s), torch.no_grad():
             for _ in range(3):
-                static_input_ids.fill_(mask_token_id)
+                static_input_ids[:, prefix_len:].fill_(mask_token_id)
                 _run_body()
         torch.cuda.current_stream(device).wait_stream(s)
         torch.cuda.synchronize(device)
@@ -859,20 +965,23 @@ def _capture_fused_denoise_graph(
         "n_known": n_known,
         "n_masks": n_masks,
         "eff_steps": len(n_unmask_per_step),
+        "prefix_len": prefix_len,
+        "width": width,
     }
 
 
 def _get_fused_denoise_graph(
     model, block_length: int, n_known: int, denoising_steps: int,
     cache: StaticBlockCache, device: torch.device, mask_token_id: int,
+    prefix_len: int = 0,
 ) -> Optional[Dict[str, Any]]:
     key = (id(model), int(block_length), int(n_known), int(denoising_steps),
-           int(cache.batch_size), str(device))
+           int(cache.batch_size), str(device), int(prefix_len))
     entry = _FUSED_DENOISE_CACHE.get(key)
     if entry is None:
         entry = _capture_fused_denoise_graph(
             model, block_length, n_known, denoising_steps, cache, device,
-            mask_token_id,
+            mask_token_id, prefix_len=prefix_len,
         )
         if entry is not None:
             _FUSED_DENOISE_CACHE[key] = entry
@@ -922,6 +1031,63 @@ def _denoise_block_fused_graph(
     new_probs = entry["per_pos_probs"][n_known:].cpu()
     new_step_map = entry["step_map"][n_known:].tolist()
     return draft_ids, new_probs, new_step_map
+
+
+def _denoise_block_fused_with_extend(
+    model,
+    cache: StaticBlockCache,
+    ctx_aligned: int,
+    prev_block: List[int],
+    block_length: int,
+    denoising_steps: int,
+    mask_token_id: int,
+    device: torch.device,
+) -> Tuple[List[int], torch.Tensor, List[int], int]:
+    """One graph replay that BOTH commits ``prev_block`` to the permanent cache
+    and denoises the next block. Replaces an ``_extend_cache_graph`` +
+    ``_denoise_block_fused_graph`` pair — one fewer draft forward per block.
+
+    Returns ``(draft_ids, per_pos_probs, step_map, new_ctx_aligned)``.
+    Only valid with an empty leftover (n_known == 0), which is exactly the
+    optimistic path in the pipelined loop after the previous block was flushed.
+    """
+    prefix_len = len(prev_block)
+    assert prefix_len == block_length, (
+        f"folded extend expects a full block, got {prefix_len}"
+    )
+    entry = _get_fused_denoise_graph(
+        model, block_length, 0, denoising_steps, cache, device, mask_token_id,
+        prefix_len=prefix_len,
+    )
+    if entry is None:
+        raise RuntimeError("folded fused-denoise graph unavailable")
+
+    width = entry["width"]
+    s0 = cache.max_cache_len                      # scratch base
+    m = entry["attn_mask"]
+    m.zero_()
+    if ctx_aligned > 0:
+        m[..., :, :ctx_aligned] = True            # committed prefix, all rows
+    # intra: prev block bidirectional among itself and invisible to nobody
+    # ahead of it; the denoising block sees prev + itself.
+    m[..., :prefix_len, s0:s0 + prefix_len] = True
+    m[..., prefix_len:, s0:s0 + width] = True
+
+    ids = list(prev_block) + [mask_token_id] * block_length
+    _fill_async_(entry["input_ids"], ids)
+    _fill_async_(entry["position_ids"],
+                 list(range(ctx_aligned, ctx_aligned + width)))
+    # prev block -> its permanent slots; the denoising block -> the slots it will
+    # eventually occupy (not yet exposed by ctx_aligned, overwritten next fold).
+    entry["cache_position"].copy_(torch.arange(
+        ctx_aligned, ctx_aligned + width, dtype=torch.long, device=device))
+
+    entry["graph"].replay()
+
+    draft_ids = entry["input_ids"][0, prefix_len:].tolist()
+    probs = entry["per_pos_probs"].cpu()
+    step_map = entry["step_map"].tolist()
+    return draft_ids, probs, step_map, ctx_aligned + prefix_len
 
 
 def _verify_block_graph(
@@ -1018,13 +1184,11 @@ def _verify_block_graph(
     leftover_pos = list(range(ctx_aligned, ctx_aligned + n_known))
     draft_pos = list(range(ctx_aligned + n_known, ctx_aligned + block_length))
     pos_ids = leftover_pos + draft_pos + draft_pos
-    in_ids_t = torch.tensor([in_ids], dtype=torch.long, device=device)
-    pos_t = torch.tensor([pos_ids], dtype=torch.long, device=device)
-
     # Inline replay  skip _replay_static_forward's redundant attn_mask.copy_
-    # since we already wrote into entry["attn_mask"] above.
-    entry["input_ids"].copy_(in_ids_t)
-    entry["position_ids"].copy_(pos_t)
+    # since we already wrote into entry["attn_mask"] above. Both uploads go
+    # through pinned staging so the host never blocks on a busy stream.
+    _fill_async_(entry["input_ids"], in_ids)
+    _fill_async_(entry["position_ids"], pos_ids)
     entry["graph"].replay()
     logits_static = entry["logits"]
 
@@ -1077,7 +1241,8 @@ def _extend_cache_graph(
         entry_mask[..., :, :ctx_aligned] = True
     entry_mask[..., :, s:s + n] = intra.unsqueeze(0).unsqueeze(0)
 
-    in_ids_t = torch.tensor([full_block], dtype=torch.long, device=device)
+    # torch.arange(..., device=cuda) is computed on-device (no H2D); only the
+    # token ids come from the host, and they go through pinned staging.
     pos_t = torch.arange(
         ctx_aligned, ctx_aligned + n, dtype=torch.long, device=device,
     ).unsqueeze(0)
@@ -1086,7 +1251,7 @@ def _extend_cache_graph(
     )
 
     # Inline replay  entry["attn_mask"] already populated above.
-    entry["input_ids"].copy_(in_ids_t)
+    _fill_async_(entry["input_ids"], full_block)
     entry["position_ids"].copy_(pos_t)
     if "cache_position" in entry and cache_pos_t is not None:
         entry["cache_position"].copy_(cache_pos_t)
@@ -1147,147 +1312,54 @@ def _prefill_prompt_static(
     return aligned_len, leftover
 
 
-def patch_causallm_pass_cache(model) -> bool:
-    """1.7B's SDARForCausalLM.forward (modeling_sdar.py:849) passes neither
-    past_key_values nor use_cache when delegating to self.model(...). This
-    means an internally-allocated DynamicCache is used per forward and our
-    accumulated cache is silently dropped. 8B's SDARForCausalLM.forward
-    (8B modeling_sdar.py:819-830) does pass them correctly.
+def patch_family_plumbing(model) -> bool:
+    """Patch whatever sits between ``model(...)`` and the attention forward so
+    our 4D bool mask and our ``store_kv`` / ``cur_scratch_pos`` kwargs arrive.
 
-    Patch: rebind SDARForCausalLM.forward so the internal self.model call
-    forwards past_key_values + use_cache + inputs_embeds. Idempotent per class.
+    What that means is family-specific (see each adapter's ``patch_plumbing``):
+
+      * SDAR — 1.7B's ``SDARForCausalLM.forward`` passes neither
+        ``past_key_values`` nor ``use_cache`` when delegating to
+        ``self.model(...)``, so an internally-allocated DynamicCache is used per
+        forward and our accumulated cache is silently dropped (8B does it
+        correctly). Rebind the CausalLM forward to 8B's delegation pattern.
+      * LLaDA2 — ``LLaDA2MoeModel.forward`` rejects any mask that is not
+        ``(B, 1, S, S)`` and neither it nor the decoder layer forwards
+        ``**kwargs`` down to the attention. Replace both forwards.
+
+    Idempotent per class. Returns True if anything was patched this call.
     """
-    import functools
-    cls = model.__class__
-    if cls.__name__ != "SDARForCausalLM":
+    adapter = adapters.detect(model)
+    if adapter is None:
         return False
-    if getattr(cls, "_cache_passthrough_patched", False):
-        return False
+    return adapter.patch_plumbing(model) > 0
 
-    orig_forward = cls.forward
 
-    @functools.wraps(orig_forward)
-    def patched_forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        cache_position=None,
-        logits_to_keep=None,
-        **kwargs,
-    ):
-        # Mirror 8B's delegation pattern: pass past_key_values + use_cache +
-        # inputs_embeds to self.model(...). Strip return_dict from kwargs to
-        # avoid duplicate-kwarg TypeError when caller passes it explicitly.
-        kwargs.pop("return_dict", None)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        hidden_states = outputs.last_hidden_state
-        if logits_to_keep is not None:
-            B, _, H = hidden_states.shape
-            num_keep = logits_to_keep.sum(dim=1)
-            assert torch.all(num_keep == num_keep[0])
-            N = int(num_keep[0].item())
-            hidden_states = hidden_states[logits_to_keep].view(B, N, H).contiguous()
-        logits = self.lm_head(hidden_states)
-        # Reuse transformers output type from the original return.
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-        return CausalLMOutputWithPast(
-            loss=None,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-    cls.forward = patched_forward
-    cls._cache_passthrough_patched = True
-    return True
+#: Kept for callers that still use the pre-adapter name.
+patch_causallm_pass_cache = patch_family_plumbing
 
 
 def patch_sdpa_with_cache(model) -> bool:
-    """Replace SDARAttention.forward with an SDPA-only eval path that ALSO
-    handles past_key_value / store_kv (the existing patch_sdpa_eval_attention
-    in draft.py drops the cache silently; the default 1.7B forward uses
-    fused_flex_attention which can't accept our bool tensor mask).
+    """Replace the family's attention forward with an SDPA-only eval path that
+    ALSO handles past_key_value / store_kv (``patch_sdpa_eval_attention`` in
+    draft.py drops the cache silently; SDAR-1.7B's default forward uses
+    fused_flex_attention, which can't accept our bool tensor mask).
+
+    This is the no-cuda-graph path: K/V lives in a growing ``DynamicCache``.
+    Body in ``adapters.base.make_eager_cache_forward``.
 
     Idempotent. Returns True if a patch was applied this call.
     """
-    import sys
-    import torch.nn.functional as F
-    from einops import rearrange
-
-    attn_cls = None
-    for m in model.modules():
-        if m.__class__.__name__ == "SDARAttention":
-            attn_cls = m.__class__
-            break
-    if attn_cls is None:
+    adapter = adapters.detect(model)
+    if adapter is None:
         return False
-    if attn_cls in _PATCHED_ATTN_CLASSES:
-        return False
+    attn_cls = adapter.find_attn_class(model)
 
-    apply_rotary_pos_emb = sys.modules[attn_cls.__module__].apply_rotary_pos_emb
-
-    def _sdpa_cache_forward(self, hidden_states, position_embeddings,
-                            attention_mask, past_key_value=None,
-                            cache_position=None, **kwargs):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # Cache integration (mirrors modeling_sdar.py SDARAttention.forward
-        # behavior at 8B lines 263-273):
-        store_kv = bool(kwargs.get("store_kv", False))
-        if past_key_value is not None and store_kv:
-            k, v = past_key_value.update(k, v, self.layer_idx)
-        elif (
-            past_key_value is not None
-            and not store_kv
-            and len(past_key_value) > self.layer_idx
-        ):
-            past_k, past_v = past_key_value[self.layer_idx]
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
-
-        mask_bool = attention_mask.bool() if attention_mask is not None else None
-        attn_output = F.scaled_dot_product_attention(
-            query=q, key=k, value=v,
-            attn_mask=mask_bool,
-            is_causal=False,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
-        attn_output = rearrange(attn_output, "b h l d -> b l (h d)")
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None
-
-    attn_cls.forward = _sdpa_cache_forward
-    _PATCHED_ATTN_CLASSES.add(attn_cls)
-    return True
+    first = _install_attn_forward(
+        attn_cls, "eager",
+        lambda: adapters.make_eager_cache_forward(adapter, attn_cls))
+    adapters.rebind_hooked_forwards(model, attn_cls)
+    return first
 
 
 def _select_verify_fn(cfg):
@@ -1672,6 +1744,46 @@ def _extend_cache(
     return ctx_len + n, cache
 
 
+def _spurious_eos_bonus(final_ids, eos_ids, bonus_token, n_accepted,
+                        target_probs, min_prob: float):
+    """Should an EOS that arrived as the MRS/greedy bonus token be *ignored*?
+
+    ``final_ids`` = accepted draft prefix + (on reject) one bonus token. The stop
+    check downstream fires on any EOS in that list, and the bonus is the one
+    element the draft never proposed:
+
+      * MRS draws it from the residual ``norm(max(0, q - p))``. EOS is textbook
+        residual mass — the target assigns it a small probability everywhere while
+        the draft essentially never proposes it mid-response — so MRS samples EOS
+        far more often than the target itself would emit it.
+      * greedy_match takes the target's argmax under the paired data/mask layout,
+        which is an approximation of sequential denoising (paper §4.3), so EOS can
+        win there on a flat distribution.
+
+    Measured effect (OpenCompass MMLU, 200 examples, B=4): the required trailing
+    "ANSWER: $LETTER" line is reached 197/200 times by target-only decoding but
+    only 175/200 (greedy_match) / 159/200 (MRS) under SimSD, with none of the
+    misses hitting the length cap — i.e. they stopped early. That is 12-17 points
+    of accuracy.
+
+    Gate: ignore a bonus EOS unless the target itself puts at least ``min_prob``
+    on EOS at that position. ``min_prob <= 0`` disables the gate and restores the
+    original behaviour exactly.
+    """
+    if min_prob <= 0.0 or bonus_token is None:
+        return False
+    if bonus_token not in eos_ids:
+        return False
+    # An EOS among the *accepted* tokens is the draft's own proposal, verified by
+    # the acceptance rule — always honour it.
+    if any(t in eos_ids for t in final_ids[:-1]):
+        return False
+    if n_accepted >= target_probs.shape[0]:
+        return False
+    p_eos = float(sum(target_probs[n_accepted, e].item() for e in eos_ids))
+    return p_eos < min_prob
+
+
 def speculative_generate_with_kv_cache(
     draft_model,
     target_model,
@@ -1706,19 +1818,40 @@ def speculative_generate_with_kv_cache(
     verify_fn = _select_verify_fn(cfg)
     mrs_order = getattr(cfg, "mrs_verify_order", "position")
     fill_mode = getattr(cfg, "partial_block_fill", "draft_argmax")
+    # 0.0 = released behaviour (any EOS in the committed block stops generation).
+    eos_min_prob = float(getattr(cfg, "eos_min_prob", 0.0))
 
-    use_cuda_graph = bool(getattr(cfg, "use_cuda_graph", False))
+    # Per-role, not one switch for both: a sharded (uncapturable) target no
+    # longer forces the draft onto the eager path. See resolve_graph_roles.
+    draft_graph, target_graph = resolve_graph_roles(
+        draft_model, target_model, bool(getattr(cfg, "use_cuda_graph", False)),
+    )
+    # Anything sized/allocated for capture is needed as soon as either role
+    # is captured.
+    use_cuda_graph = draft_graph or target_graph
 
-    if use_cuda_graph:
-        # Static-shape cache + per-(op,cur_len) cuda_graph cache.
-        patch_sdpa_static_cache(draft_model)
-        if draft_model is not target_model:
-            patch_sdpa_static_cache(target_model)
-    else:
-        # DynamicCache + cat-style attention (no graph).
-        patch_sdpa_with_cache(draft_model)
-        if draft_model is not target_model:
-            patch_sdpa_with_cache(target_model)
+    if use_cuda_graph and draft_model is target_model:
+        # StaticBlockCache is stashed on the model as ``_kv_static_cache`` so its
+        # buffer addresses survive across requests (cuda_graphs capture
+        # addresses). One model object therefore owns exactly one cache, and a
+        # self-draft run would have draft and target writing the same K/V slots.
+        # The eager path is unaffected: it allocates two independent
+        # DynamicCaches regardless. Load the checkpoint twice if you need a
+        # self-draft run under cuda_graph.
+        raise ValueError(
+            "self-draft (draft_model is target_model) is not supported with "
+            "use_cuda_graph=True: both roles would share one StaticBlockCache. "
+            "Run eager, or load two separate copies of the checkpoint."
+        )
+
+    # Static-shape cache + per-(op,cur_len) graph cache for a captured role;
+    # DynamicCache + cat-style attention for an eager one. resolve_graph_roles
+    # has already guaranteed the two roles do not share an attention class when
+    # the modes differ, so these patches cannot overwrite each other.
+    (patch_sdpa_static_cache if draft_graph else patch_sdpa_with_cache)(draft_model)
+    if draft_model is not target_model:
+        (patch_sdpa_static_cache if target_graph
+         else patch_sdpa_with_cache)(target_model)
     # Also patch SDARForCausalLM.forward  1.7B's version drops past_key_values
     # when delegating to self.model(...) (8B does it correctly). This patch
     # makes 1.7B forward like 8B.
@@ -1767,30 +1900,50 @@ def speculative_generate_with_kv_cache(
             keys_to_drop = [k for k in _STATIC_GRAPH_CACHE if k[0] == id(model)]
             for k in keys_to_drop:
                 _STATIC_GRAPH_CACHE.pop(k, None)
+            # _FUSED_DENOISE_CACHE keeps its own graphs, whose captured attn_mask
+            # is sized to the OLD cache's full_len. Dropping only
+            # _STATIC_GRAPH_CACHE leaves them stale and the next fused denoise
+            # dies with "size of tensor a (old full_len) must match tensor b".
+            # Only reachable when kv_cache_max_len changes between requests in
+            # one process (e.g. sizing the cache per dataset).
+            for k in [k for k in _FUSED_DENOISE_CACHE if k[0] == id(model)]:
+                _FUSED_DENOISE_CACHE.pop(k, None)
             return new_cache
 
-        draft_cache = _get_or_create(draft_model, draft_device)
-        target_cache = _get_or_create(target_model, target_device)
-        # Aligned-prefill (eager) writes prompt K/V into cache permanent slots.
-        draft_ctx_aligned, draft_leftover = _prefill_prompt_static(
-            draft_model, prompt_ids, draft_cache, draft_device,
+    def _setup_role(model, device, graph):
+        """(cache, ctx_aligned, leftover) for one role, in its own mode."""
+        if graph:
+            cache = _get_or_create(model, device)
+            # Aligned-prefill (eager) writes prompt K/V into permanent slots.
+            ctx_aligned, leftover = _prefill_prompt_static(
+                model, prompt_ids, cache, device, block_length=block_length,
+            )
+            return cache, ctx_aligned, leftover
+        ctx_aligned, cache, leftover = _prefill_prompt(
+            model, prompt_ids, DynamicCache(), device,
             block_length=block_length,
         )
-        target_ctx_aligned, target_leftover = _prefill_prompt_static(
-            target_model, prompt_ids, target_cache, target_device,
-            block_length=block_length,
-        )
-    else:
-        draft_cache = DynamicCache()
-        target_cache = DynamicCache()
-        draft_ctx_aligned, draft_cache, draft_leftover = _prefill_prompt(
-            draft_model, prompt_ids, draft_cache, draft_device,
-            block_length=block_length,
-        )
-        target_ctx_aligned, target_cache, target_leftover = _prefill_prompt(
-            target_model, prompt_ids, target_cache, target_device,
-            block_length=block_length,
-        )
+        return cache, ctx_aligned, leftover
+
+    draft_cache, draft_ctx_aligned, draft_leftover = _setup_role(
+        draft_model, draft_device, draft_graph,
+    )
+    target_cache, target_ctx_aligned, target_leftover = _setup_role(
+        target_model, target_device, target_graph,
+    )
+
+    def _extend_role(model, cache, ctx_aligned, block, device, graph):
+        """Flush one full block into a role's K/V cache.
+
+        Returns ``(ctx_aligned, cache)`` in both modes: the graph path mutates
+        its fixed buffers in place (so the cache object is unchanged), the eager
+        path may hand back a different DynamicCache.
+        """
+        if graph:
+            ctx = _extend_cache_graph(model, cache, ctx_aligned, block, device)
+            return ctx, cache
+        return _extend_cache(model, cache, ctx_aligned, block, device)
+
     assert draft_ctx_aligned == target_ctx_aligned
     assert draft_leftover == target_leftover  # same prompt
     leftover: List[int] = list(draft_leftover)
@@ -1813,27 +1966,21 @@ def speculative_generate_with_kv_cache(
         # happen since we flush below when full), drain it before denoising.
         while len(leftover) >= block_length:
             full_block = leftover[:block_length]
-            if use_cuda_graph:
-                draft_ctx_aligned = _extend_cache_graph(
-                    draft_model, draft_cache, draft_ctx_aligned, full_block, draft_device,
-                )
-                target_ctx_aligned = _extend_cache_graph(
-                    target_model, target_cache, target_ctx_aligned, full_block, target_device,
-                )
-            else:
-                draft_ctx_aligned, draft_cache = _extend_cache(
-                    draft_model, draft_cache, draft_ctx_aligned, full_block, draft_device,
-                )
-                target_ctx_aligned, target_cache = _extend_cache(
-                    target_model, target_cache, target_ctx_aligned, full_block, target_device,
-                )
+            draft_ctx_aligned, draft_cache = _extend_role(
+                draft_model, draft_cache, draft_ctx_aligned, full_block,
+                draft_device, draft_graph,
+            )
+            target_ctx_aligned, target_cache = _extend_role(
+                target_model, target_cache, target_ctx_aligned, full_block,
+                target_device, target_graph,
+            )
             leftover = leftover[block_length:]
 
         n_known = len(leftover)
         n_masks = block_length - n_known
         # n_masks > 0 here (we just ensured leftover < block_length).
 
-        if use_cuda_graph:
+        if draft_graph:
             draft_ids, draft_probs, step_map = _denoise_block_graph(
                 draft_model, draft_cache, draft_ctx_aligned, leftover,
                 block_length, denoising_steps, mask_token_id, draft_device,
@@ -1857,7 +2004,7 @@ def speculative_generate_with_kv_cache(
             torch.cuda.synchronize()
             t1 = time.perf_counter()
 
-        if use_cuda_graph:
+        if target_graph:
             target_probs = _verify_block_graph(
                 target_model, target_cache, target_ctx_aligned, leftover,
                 draft_ids, step_map, block_length, mask_token_id, target_device,
@@ -1947,20 +2094,14 @@ def speculative_generate_with_kv_cache(
 
         if len(leftover) >= block_length:
             full_block = leftover[:block_length]
-            if use_cuda_graph:
-                draft_ctx_aligned = _extend_cache_graph(
-                    draft_model, draft_cache, draft_ctx_aligned, full_block, draft_device,
-                )
-                target_ctx_aligned = _extend_cache_graph(
-                    target_model, target_cache, target_ctx_aligned, full_block, target_device,
-                )
-            else:
-                draft_ctx_aligned, draft_cache = _extend_cache(
-                    draft_model, draft_cache, draft_ctx_aligned, full_block, draft_device,
-                )
-                target_ctx_aligned, target_cache = _extend_cache(
-                    target_model, target_cache, target_ctx_aligned, full_block, target_device,
-                )
+            draft_ctx_aligned, draft_cache = _extend_role(
+                draft_model, draft_cache, draft_ctx_aligned, full_block,
+                draft_device, draft_graph,
+            )
+            target_ctx_aligned, target_cache = _extend_role(
+                target_model, target_cache, target_ctx_aligned, full_block,
+                target_device, target_graph,
+            )
             leftover = leftover[block_length:]
 
         if return_timings:
@@ -1976,7 +2117,36 @@ def speculative_generate_with_kv_cache(
             })
 
         if eos_ids and any(t in eos_ids for t in final_ids):
-            break
+            # Attribute the stop: an EOS the draft proposed and the acceptance
+            # rule confirmed is a different failure mode from one the bonus
+            # invented, and only the latter is gateable without a re-forward.
+            _from_bonus = (bonus_token is not None and bonus_token in eos_ids
+                           and not any(t in eos_ids for t in final_ids[:-1]))
+            _k = "eos_stop_from_bonus" if _from_bonus else "eos_stop_from_accepted"
+            stats[_k] = stats.get(_k, 0) + 1
+            # How much probability did the target itself put on EOS there? Tells
+            # apart "the target really wanted to stop" from "a flat distribution
+            # let a low-confidence EOS through", which decides whether a simple
+            # probability gate can help at all.
+            try:
+                _pos = min(next(i for i, t in enumerate(final_ids)
+                                if t in eos_ids), target_probs.shape[0] - 1)
+                stats.setdefault("eos_stop_q", []).append(
+                    float(sum(target_probs[_pos, e].item() for e in eos_ids)))
+            except (StopIteration, IndexError):
+                pass
+            # Only drop it while it is still uncommitted: the leftover flush above
+            # may already have written it into the K/V cache, and removing it from
+            # the emitted stream then would desync text from context.
+            if (_spurious_eos_bonus(final_ids, eos_ids, bonus_token, n_accepted,
+                                    target_probs, eos_min_prob)
+                    and leftover and leftover[-1] == bonus_token
+                    and all_generated and all_generated[-1] == bonus_token):
+                all_generated = all_generated[:-1]
+                leftover = leftover[:-1]
+                stats["dropped_eos_bonus"] = stats.get("dropped_eos_bonus", 0) + 1
+            else:
+                break
 
     # Strip trailing MASKs (shouldn't happen, but matches existing path).
     while all_generated and all_generated[-1] == mask_token_id:
@@ -2036,8 +2206,20 @@ def speculative_generate_with_kv_cache_pipelined(
 
     assert getattr(cfg, "K", 1) == 1, \
         "cache_aware pipelined: only K=1 supported"
+    # Unlike the nopipe path, this one cannot mix modes: the overlap is between
+    # two captured graphs on two streams. Report which role blocks capture
+    # rather than failing later inside patch_sdpa_static_cache.
     assert bool(getattr(cfg, "use_cuda_graph", False)), \
         "cache_aware pipelined: requires use_cuda_graph=True"
+    for _role, _m in (("draft", draft_model), ("target", target_model)):
+        _ok, _why = graph_capability(_m)
+        if not _ok:
+            raise RuntimeError(
+                f"cache_aware pipelined: the {_role} cannot be cuda_graph "
+                f"captured ({_why}). This path needs both roles captured; use "
+                f"speculative_generate_with_kv_cache, which runs each role in "
+                f"whichever mode it supports."
+            )
 
     draft_device = next(draft_model.parameters()).device
     target_device = next(target_model.parameters()).device
@@ -2056,10 +2238,16 @@ def speculative_generate_with_kv_cache_pipelined(
     early_active = 0 < early_stop_steps < denoising_steps
     fused_denoise = bool(getattr(cfg, "fused_denoise", False))
     speculative_target_extend = bool(getattr(cfg, "speculative_target_extend", False))
+    # Fold the draft-side cache extend into the next fused denoise (one fewer
+    # draft forward per block). Requires the fused path and a full optimistic
+    # block; falls back automatically otherwise. See docs/optimize-extend.md.
+    fold_draft_extend = bool(getattr(cfg, "fold_draft_extend", False)) and fused_denoise
 
     verify_fn = _select_verify_fn(cfg)
     mrs_order = getattr(cfg, "mrs_verify_order", "position")
     fill_mode = getattr(cfg, "partial_block_fill", "draft_argmax")
+    # 0.0 = released behaviour (any EOS in the committed block stops generation).
+    eos_min_prob = float(getattr(cfg, "eos_min_prob", 0.0))
 
     # Patches (idempotent).
     patch_sdpa_static_cache(draft_model)
@@ -2101,6 +2289,10 @@ def speculative_generate_with_kv_cache_pipelined(
         keys_to_drop = [k for k in _STATIC_GRAPH_CACHE if k[0] == id(model)]
         for k in keys_to_drop:
             _STATIC_GRAPH_CACHE.pop(k, None)
+        # See the note at the sibling site: the fused-denoise graphs are keyed
+        # separately and must be invalidated together with the static ones.
+        for k in [k for k in _FUSED_DENOISE_CACHE if k[0] == id(model)]:
+            _FUSED_DENOISE_CACHE.pop(k, None)
         return new_cache
 
     draft_cache = _get_or_create(draft_model, draft_device)
@@ -2209,31 +2401,52 @@ def speculative_generate_with_kv_cache_pipelined(
             if return_timings:
                 with torch.cuda.device(draft_device):
                     ev["ext_start"].record()
-            draft_ctx_aligned = _extend_cache_graph(
-                draft_model, draft_cache, draft_ctx_aligned, opt_block,
-                draft_device,
-            )
-            if speculative_target_extend:
-                target_ctx_aligned = _extend_cache_graph(
-                    target_model, target_cache, target_ctx_aligned, opt_block,
-                    target_device,
+            if fold_draft_extend:
+                # The draft extend rides inside the denoise graph below; issue
+                # the target extend first so it is already queued on the other
+                # stream while the (now wider) draft forward runs.
+                if speculative_target_extend:
+                    target_ctx_aligned = _extend_cache_graph(
+                        target_model, target_cache, target_ctx_aligned,
+                        opt_block, target_device,
+                    )
+                    opt_target_extended = True
+                if return_timings:
+                    with torch.cuda.device(draft_device):
+                        ev["ext_end"].record()
+                        ev["den_start"].record()
+                _nd = _denoise_block_fused_with_extend(
+                    draft_model, draft_cache, draft_ctx_aligned, opt_block,
+                    block_length, denoising_steps, mask_token_id, draft_device,
                 )
-                opt_target_extended = True
-            if return_timings:
-                with torch.cuda.device(draft_device):
-                    ev["ext_end"].record()
-                    ev["den_start"].record()
-            # draft_{N+1}: leftover for the next block is empty (we just
-            # optimistically flushed the current block). n_masks_next == bl.
-            next_draft = _denoise_block_graph_dispatch(
-                draft_model, draft_cache, draft_ctx_aligned, [],
-                block_length, denoising_steps, mask_token_id, draft_device,
-                sampling=sampling,
-                remasking_strategy=remasking_strategy,
-                confidence_threshold=confidence_threshold,
-                early_stop_steps=early_stop_steps,
-                fused=fused_denoise,
-            )
+                next_draft = (_nd[0], _nd[1], _nd[2])
+                draft_ctx_aligned = _nd[3]
+            else:
+                draft_ctx_aligned = _extend_cache_graph(
+                    draft_model, draft_cache, draft_ctx_aligned, opt_block,
+                    draft_device,
+                )
+                if speculative_target_extend:
+                    target_ctx_aligned = _extend_cache_graph(
+                        target_model, target_cache, target_ctx_aligned,
+                        opt_block, target_device,
+                    )
+                    opt_target_extended = True
+                if return_timings:
+                    with torch.cuda.device(draft_device):
+                        ev["ext_end"].record()
+                        ev["den_start"].record()
+                # draft_{N+1}: leftover for the next block is empty (we just
+                # optimistically flushed the current block). n_masks_next == bl.
+                next_draft = _denoise_block_graph_dispatch(
+                    draft_model, draft_cache, draft_ctx_aligned, [],
+                    block_length, denoising_steps, mask_token_id, draft_device,
+                    sampling=sampling,
+                    remasking_strategy=remasking_strategy,
+                    confidence_threshold=confidence_threshold,
+                    early_stop_steps=early_stop_steps,
+                    fused=fused_denoise,
+                )
             if return_timings:
                 with torch.cuda.device(draft_device):
                     ev["den_end"].record()
@@ -2370,7 +2583,36 @@ def speculative_generate_with_kv_cache_pipelined(
             per_block_events.append(ev)
 
         if eos_ids and any(t in eos_ids for t in final_ids):
-            break
+            # Attribute the stop: an EOS the draft proposed and the acceptance
+            # rule confirmed is a different failure mode from one the bonus
+            # invented, and only the latter is gateable without a re-forward.
+            _from_bonus = (bonus_token is not None and bonus_token in eos_ids
+                           and not any(t in eos_ids for t in final_ids[:-1]))
+            _k = "eos_stop_from_bonus" if _from_bonus else "eos_stop_from_accepted"
+            stats[_k] = stats.get(_k, 0) + 1
+            # How much probability did the target itself put on EOS there? Tells
+            # apart "the target really wanted to stop" from "a flat distribution
+            # let a low-confidence EOS through", which decides whether a simple
+            # probability gate can help at all.
+            try:
+                _pos = min(next(i for i, t in enumerate(final_ids)
+                                if t in eos_ids), target_probs.shape[0] - 1)
+                stats.setdefault("eos_stop_q", []).append(
+                    float(sum(target_probs[_pos, e].item() for e in eos_ids)))
+            except (StopIteration, IndexError):
+                pass
+            # Only drop it while it is still uncommitted: the leftover flush above
+            # may already have written it into the K/V cache, and removing it from
+            # the emitted stream then would desync text from context.
+            if (_spurious_eos_bonus(final_ids, eos_ids, bonus_token, n_accepted,
+                                    target_probs, eos_min_prob)
+                    and leftover and leftover[-1] == bonus_token
+                    and all_generated and all_generated[-1] == bonus_token):
+                all_generated = all_generated[:-1]
+                leftover = leftover[:-1]
+                stats["dropped_eos_bonus"] = stats.get("dropped_eos_bonus", 0) + 1
+            else:
+                break
 
     # End-of-sample: drain both streams and compute elapsed_time for events.
     # This is the ONLY GPU sync introduced by timing  all per-block records
@@ -2449,7 +2691,18 @@ def native_generate_with_kv_cache(model, prompt_ids, cfg, eos_ids=None,
     num_blocks = cfg.num_blocks
     mask_token_id = cfg.mask_token_id
     sampling = getattr(cfg, "draft_sampling", "argmax")
+    # Same "capture whatever can be captured" rule the spec path uses, so a
+    # single cfg flag can drive both arms of a comparison: a sharded target
+    # silently runs eager here instead of raising, exactly as it does when it is
+    # the target of a spec run. Keeps the two arms' target implementation
+    # identical, which is the fairness requirement.
     use_cuda_graph = bool(getattr(cfg, "use_cuda_graph", False))
+    if use_cuda_graph:
+        _ok, _why = graph_capability(model)
+        if not _ok:
+            _log_graph_decision("target-only", model,
+                                f"[cuda_graph] target-only: eager ({_why})")
+            use_cuda_graph = False
     # generate.py-compatible vanilla sampling knobs (defaults preserve current
     # native behavior: pure softmax, no temp/top_k/top_p, low_confidence_static).
     temperature = float(getattr(cfg, "temperature", 1.0))
@@ -2500,6 +2753,14 @@ def native_generate_with_kv_cache(model, prompt_ids, cfg, eos_ids=None,
             keys_to_drop = [k for k in _STATIC_GRAPH_CACHE if k[0] == id(model)]
             for k in keys_to_drop:
                 _STATIC_GRAPH_CACHE.pop(k, None)
+            # _FUSED_DENOISE_CACHE keeps its own graphs, whose captured attn_mask
+            # is sized to the OLD cache's full_len. Dropping only
+            # _STATIC_GRAPH_CACHE leaves them stale and the next fused denoise
+            # dies with "size of tensor a (old full_len) must match tensor b".
+            # Only reachable when kv_cache_max_len changes between requests in
+            # one process (e.g. sizing the cache per dataset).
+            for k in [k for k in _FUSED_DENOISE_CACHE if k[0] == id(model)]:
+                _FUSED_DENOISE_CACHE.pop(k, None)
 
     if return_timings:
         torch.cuda.synchronize()

@@ -1,0 +1,71 @@
+# LLaDA2 · latency — the arm to cite throughput from.
+#
+#   python run_protocol.py llada2_latency --arm both
+#
+# EOS off, fixed length: both arms emit the same token count, so the tok/s ratio
+# is a pure time ratio with no EOS-induced length difference mixed in.
+#
+# Identical to llada2_quality.yaml except for three keys: no_eos_stop,
+# gen_length 128 (must be divisible by block_length; bl=4/8/16/32 -> 32/16/8/4
+# iterations), and num_samples 100 — throughput varies far less than pass@1, so
+# the sample budget goes to the quality arm instead.
+#
+# Read tokens_per_second_paper (prefill excluded). SUMMARY.json also carries
+# tokens_per_second, which INCLUDES prefill and reads lower; do not use it.
+#
+# The pass_at_1 in this arm is garbage — fixed length truncates answers
+# mid-sentence (target gsm8k measures 0.22-0.25 here vs 0.925 in the quality
+# arm). scripts/52_bl_sweep_table.py prints a warning when it sees no_eos_stop.
+
+name: llada2_latency
+family: llada2
+mode: latency
+
+models:
+  target: inclusionAI/LLaDA2.0-flash
+  draft: inclusionAI/LLaDA2.0-mini
+
+runner: main_table/run_paper_protocol.py
+target_max_memory: 88GiB
+default_arms: [target, ours]
+
+# Block lengths that were actually swept; --bl picks one. LLaDA2 uses one model
+# pair for all of them (unlike SDAR, which needs a different checkpoint per bl).
+bl_choices: [4, 8, 16, 32]
+
+arms:
+  ours:
+    method: simsd_dual
+    needs_draft: true
+    draft_device: cuda:0
+    target_gpus: [1, 2, 3, 4]
+  target:
+    method: native_single
+    target_gpus: [0, 1, 2, 3, 4]
+
+args:
+  mask_token_id: 156895
+  dtype: bfloat16
+  seed: 42
+
+  block_length: 16
+  denoising_steps: 16
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax
+  speculative_branch: greedy_match
+  partial_block_fill: truncate
+
+  prompts: opencompass
+  shuffle_seed: 42
+  mmlu_style: 5shot
+
+  no_eos_stop: true
+  gen_length: 128
+  num_samples: 100
+  n_warmup: 3
+  kv_cache_max_len: 0
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  fused_moe: true
+
+output_dir: runs/protocol/llada2_latency

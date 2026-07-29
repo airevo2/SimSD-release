@@ -1,0 +1,76 @@
+# SDAR · quality — truncate + argmax, aligned with llada2_quality.
+#
+#   python run_protocol.py sdar_quality --arm both            # bl=4
+#   python run_protocol.py sdar_quality --arm both --bl 8     # bl=8
+#
+# Reproduces runs/t1/*_am_oc_s42_n200 (argmax + greedy_match + truncate), with one
+# deliberate change: mmlu_style is 5shot rather than the original simple_evals
+# (0-shot CoT), so the protocol matches LLaDA2 exactly. Under CoT the iteration
+# budget becomes a hidden variable and MMLU drops 12.5pp (bl=4) / 19.0pp (bl=8);
+# under 5shot both block lengths land at exactly +-0.0. That data is in
+# runs/sdar_align/.
+#
+# SDAR's bl=4 and bl=8 are two DIFFERENT checkpoint pairs (each trained for its
+# block length), not one model with a parameter changed — unlike LLaDA2. That is
+# why bl is expressed through `checkpoints:` and --bl picks the pair.
+#
+# MMLU's speedup here is below 1 (0.87x at bl=4, 0.62x at bl=8): 5shot emits only
+# 6-8 tokens while the block is 4-8 wide, so one or two blocks end the answer and
+# speculation's fixed cost never amortises. When reporting a speed mean, either
+# annotate the output lengths or exclude MMLU and say so.
+#
+# The paper's own sampling (§4.1) is multinomial + MRS; that variant lives in
+# runs/t1/*_mrs_oc_s42_n200. This file uses argmax + greedy_match so the numbers
+# are directly comparable to LLaDA2.
+
+name: sdar_quality
+family: sdar
+mode: quality
+
+checkpoints:
+  4:
+    target: JetLM/SDAR-8B-Chat
+    draft: ./models/SDAR-1_7B-Chat
+  8:
+    target: JetLM/SDAR-8B-Chat-b8
+    draft: JetLM/SDAR-1.7B-Chat-b8
+
+# 8B fits on one card, so no sharding: draft and target take one GPU each.
+runner: main_table/run_paper_protocol.py
+default_arms: [target, ours]
+
+arms:
+  ours:
+    method: simsd_pipe
+    needs_draft: true
+    draft_device: cuda:0
+    target_device: cuda:1
+  target:
+    method: native_single
+    target_device: cuda:0
+
+args:
+  mask_token_id: 151669
+  dtype: bfloat16
+  seed: 42
+
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax
+  speculative_branch: greedy_match
+  partial_block_fill: truncate
+  temperature: 1.0
+  top_p: 1.0
+
+  prompts: opencompass
+  shuffle_seed: 42
+  mmlu_style: 5shot
+
+  gen_length: 0
+  num_samples: 200
+  n_warmup: 3
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  fused_denoise: true
+  speculative_target_extend: true
+
+output_dir: runs/protocol/sdar_quality

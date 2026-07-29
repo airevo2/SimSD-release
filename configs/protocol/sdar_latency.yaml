@@ -1,0 +1,127 @@
+# SDAR · latency — the historical breakdown protocol plus the full kernel stack.
+#
+#   python run_protocol.py sdar_latency --arm ours      # full kernel stack
+#   python run_protocol.py sdar_latency --arm nat1      # single GPU + CUDA graph
+#   python run_protocol.py sdar_latency --arm tp2cg     # the paper's Vanilla+CG row
+#   python run_protocol.py sdar_latency --arm tp2van    # the paper's Vanilla row
+#   python run_protocol.py sdar_latency --arm both      # = default_arms, serial
+#
+# This file reproduces where the historical numbers actually came from, so it
+# differs from llada2_latency on purpose:
+#
+#   * The runner varies BY ARM — ours uses run_ours_dual_gpu.py, the three
+#     baselines use *_tp2_cache.py under torchrun. That split is the provenance
+#     of these numbers and cannot be unified away.
+#   * Prompts are the repo's hand-written ones, NOT OpenCompass:
+#     run_ours_dual_gpu.py only has load_prompts() — no --prompts/--shuffle_seed/
+#     --mmlu_style. So these numbers CANNOT be compared against sdar_quality or
+#     llada2_latency (prompt length differs by an order of magnitude).
+#   * Fixed length is expressed as --num_blocks (bl=4 -> 32 blocks = 128 tokens),
+#     not --gen_length. `fixed_tokens` below makes the entry point recompute it.
+#   * gsm8k only, N=20: this is the per-stage breakdown protocol, not a benchmark.
+#
+# Historical baseline (bl=4, gsm8k, idle node), tok/s:
+#     tp2van   9.1   TP=2 without CUDA graph  (the paper's Vanilla row)
+#     tp2cg   50.1   TP=2 with CUDA graph     (the paper's Vanilla+CG row)
+#     nat1    40.9   single GPU + CUDA graph
+#     sdp     58.3   ours, two GPUs + pipeline, before optimisation
+#             79.0   + pinned staging + kv auto-sizing
+#             91.2   + fold_draft_extend   (extend window 7.69 -> 0.12 ms)
+#             90.0   + fused_linear draft  (measured against 79.0; rho 0.470 -> 0.387)
+#
+# Three things to know before reading any number this produces:
+#
+#   1. The `ours` arm enables fold_draft_extend AND fused_linear draft together,
+#      and that combination has NEVER been measured (kernel-optimization.md §8):
+#      the kernel's 90.0 was measured against the 79.0 baseline while fold's 91.2
+#      is a different line, and both touch the draft stream, so the gains should
+#      not be added. Whatever comes out IS the answer to that gap — do not assume
+#      it equals 91.2 or 90.0.
+#   2. fused_linear is not bit-identical to cuBLAS. The n=20 strict gate shows
+#      20/20 identical text and unchanged alpha (0.8955), but the N=200
+#      statistical gate (scripts/37_fused_linear_quality.sh, MODE=quality) has
+#      not been run.
+#   3. Sampling and remasking are deliberately absent from the shared `args:`.
+#      Each TP runner's argparse DEFAULT is its own canonical protocol
+#      (vanilla = multinomial + low_confidence_dynamic, native = argmax +
+#      low_confidence_static) — that is what defines the paper's two baseline
+#      rows. Passing them explicitly would override those defaults and tp2van
+#      would stop reproducing 9.1. speculative_branch / partial_block_fill are
+#      not accepted by those runners at all.
+#
+# Running *_tp2_cache.py by hand hangs in dist.destroy_process_group() after
+# writing SUMMARY (NCCL + cuda_graph teardown deadlock) and holds the GPUs
+# forever. This entry point has no watchdog — check for stragglers afterwards.
+
+name: sdar_latency
+family: sdar
+mode: latency
+note: historical breakdown protocol (repo prompts, gsm8k, N=20) + full kernel stack; not comparable across arms of other files
+
+checkpoints:
+  4:
+    target: JetLM/SDAR-8B-Chat
+    draft: ./models/SDAR-1_7B-Chat
+  8:
+    target: JetLM/SDAR-8B-Chat-b8
+    draft: JetLM/SDAR-1.7B-Chat-b8
+
+fixed_tokens: 128
+default_arms: [nat1, tp2cg, ours]
+
+arms:
+  ours:
+    runner: main_table/run_ours_dual_gpu.py
+    needs_draft: true
+    draft_device: cuda:0
+    target_device: cuda:1
+    args:
+      use_cuda_graph: true
+      pipeline: true
+      fused_denoise: true
+      fold_draft_extend: true
+      speculative_target_extend: true
+      fused_linear: draft
+      kv_cache_max_len: 0
+      return_timings: true
+      remasking_strategy: low_confidence_static
+      draft_sampling: argmax
+      speculative_branch: greedy_match
+      partial_block_fill: truncate
+      mrs_verify_order: position
+
+  nat1:
+    runner: main_table/run_native_tp2_cache.py
+    torchrun: 1
+    gpus: 1
+    args:
+      use_cuda_graph: true
+      breakdown: true
+
+  tp2cg:
+    runner: main_table/run_native_tp2_cache.py
+    torchrun: 2
+    gpus: 2
+    args:
+      use_cuda_graph: true
+      breakdown: true
+
+  tp2van:
+    runner: main_table/run_vanilla_tp2_cache.py
+    torchrun: 2
+    gpus: 2
+    args:
+      breakdown: true
+
+# Only keys all three runners accept — see note 3 in the header.
+args:
+  mask_token_id: 151669
+  seed: 42
+  block_length: 4
+  denoising_steps: 4
+  num_blocks: 32
+  no_eos_stop: true
+  num_samples: 20
+  datasets: [gsm8k]
+
+output_dir: runs/protocol/sdar_latency

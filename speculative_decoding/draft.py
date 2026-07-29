@@ -1,83 +1,48 @@
 """Draft model: standard multi-step block diffusion generation."""
 
-import sys
-
 import torch
 import torch.nn.functional as F
 
-MASK_TOKEN_ID = 151669
+from speculative_decoding import adapters
+from speculative_decoding.adapters.sdar import MASK_TOKEN_ID as SDAR_MASK_TOKEN_ID
+
+#: Legacy default for the no-KV-cache path, which predates multi-family support
+#: and is only ever run on SDAR. Every cache-aware entry point takes the id from
+#: ``cfg.mask_token_id`` instead — see ``adapters.get(family).mask_token_id``.
+MASK_TOKEN_ID = SDAR_MASK_TOKEN_ID
 
 
 _SDPA_PATCHED_CLASSES: set = set()
 
 
 def patch_sdpa_eval_attention(model) -> bool:
-    """Permanently replace SDAR eval-mode attention forward with an SDPA-only
-    variant. Idempotent: patching the same class twice is a no-op.
+    """Permanently replace the family's eval-mode attention forward with an
+    SDPA-only variant. Idempotent: patching the same class twice is a no-op.
 
-    Why: upstream eval path (``modeling_sdar.SDARAttention.forward``) dispatches
-    between flash_attn and SDPA via ``if torch.all(attention_mask)``. That call
-    triggers a GPUCPU sync, which (a) forbids ``torch.cuda.graph`` capture,
-    and (b) is dead logic for our use  draft's block-causal mask is never
-    all-ones, so the SDPA branch is the only one that ever fires.
+    Why: SDAR's upstream eval path (``modeling_sdar.SDARAttention.forward``)
+    dispatches between flash_attn and SDPA via ``if torch.all(attention_mask)``.
+    That call triggers a GPUCPU sync, which (a) forbids ``torch.cuda.graph``
+    capture, and (b) is dead logic for our use  draft's block-causal mask is
+    never all-ones, so the SDPA branch is the only one that ever fires.
 
     Locking both draft and target (under ``--target_eval_sdpa``) to the same
     SDPA kernel path also keeps their latency profiles directly comparable.
 
-    Returns True if the class was patched this call, False if already patched.
-    Training-mode path (fused_flex_attention) is untouched.
+    Returns True if the class was patched this call, False if already patched
+    or if no adapter recognises the model. Training-mode path
+    (fused_flex_attention) is untouched where the family has one.
     """
-    from einops import rearrange
-
-    attn_mod = model.model.layers[0].self_attn
-    attn_cls = type(attn_mod)
-    if attn_cls in _SDPA_PATCHED_CLASSES:
+    adapter = adapters.detect(model)
+    if adapter is None:
         return False
+    attn_cls = adapter.find_attn_class(model)
 
-    apply_rotary_pos_emb = sys.modules[attn_cls.__module__].apply_rotary_pos_emb
-    fused_flex_attention = getattr(
-        sys.modules[attn_cls.__module__], "fused_flex_attention", None)
-
-    def _sdpa_eval_forward(self, hidden_states, position_embeddings,
-                           attention_mask, past_key_value=None,
-                           cache_position=None, **kwargs):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        if self.training and fused_flex_attention is not None:
-            # Preserve training path bit-for-bit.
-            attn_output, attn_weights = fused_flex_attention(
-                query=q, key=k, value=v,
-                attention_mask=attention_mask,
-                enable_gqa=True, scale=self.scaling, return_lse=True,
-            )
-            attn_weights = attn_weights.to(v.dtype) if attn_weights is not None else None
-            attn_output = rearrange(attn_output, "b h l d -> b l (h d)")
-            attn_output = self.o_proj(attn_output)
-            return attn_output, attn_weights
-
-        mask_bool = attention_mask.bool() if attention_mask is not None else None
-        attn_output = F.scaled_dot_product_attention(
-            query=q, key=k, value=v,
-            attn_mask=mask_bool,
-            is_causal=False,
-            scale=self.scaling,
-            enable_gqa=True,
-        )
-        attn_output = rearrange(attn_output, "b h l d -> b l (h d)")
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None
-
-    attn_cls.forward = _sdpa_eval_forward
+    from speculative_decoding.cache_aware import _install_attn_forward
+    first = _install_attn_forward(
+        attn_cls, "eval", lambda: adapters.make_eval_forward(adapter, attn_cls))
     _SDPA_PATCHED_CLASSES.add(attn_cls)
-    return True
+    adapters.rebind_hooked_forwards(model, attn_cls)
+    return first
 
 
 def _build_block_causal_attn(seq_len, block_length, device):

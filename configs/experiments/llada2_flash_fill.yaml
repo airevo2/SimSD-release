@@ -1,0 +1,72 @@
+# L1 — lever 2 alone: keep every draft token, fill the rejected tail.
+#
+#   python main.py -e configs/experiments/llada2_flash_fill.yaml
+#
+# Identical to llada2_flash.yaml's `ours` arm except partial_block_fill.
+#
+# Why. At alpha 0.744 the L0 run committed 18.2 tokens per block against the
+# baseline's 27.1 — `truncate` throws away every position after the first
+# rejection, so a third of each block is re-decoded next iteration. The target's
+# per-position probabilities for exactly those positions are already in hand
+# from the verify forward, so filling from their argmax costs no extra forward
+# at all. This is also the SDAR default (post 2026-05-06, ~50% TPS on bl=8
+# gsm8k); L0 only used `truncate` because the LLaDA2 bring-up config inherited
+# it, not because anything argued for it here.
+#
+# What it should move: tokens/block up, wall-clock per block unchanged, so
+# tok/s up. What it risks: the filled tokens were conditioned on draft tokens
+# the acceptance rule had just rejected ("stale pad"), so pass@1 may not follow
+# tok/s. Both are in the breakdown.
+#
+# No baseline arm — reuse the native_sharded numbers from runs/llada2_flash;
+# nothing here changes the target or its placement.
+
+name: llada2-flash-fill-target-argmax
+family: llada2
+
+models:
+  target: inclusionAI/LLaDA2.0-flash
+  draft: inclusionAI/LLaDA2.0-mini
+
+tokens:
+  mask_token_id: 156895
+
+block:
+  block_length: 32
+  denoising_steps: 32
+
+data:
+  datasets: [gsm8k]
+  num_samples: 50
+
+methods: [ours]
+modes: [quality]
+
+mode_settings:
+  quality:
+    num_blocks: 8
+
+runtime:
+  gpus: "0,1,2,3,4"
+  draft_device: cuda:0
+  target_gpus: [1, 2, 3, 4]
+  target_max_memory: 88GiB
+  use_cuda_graph: false
+  pipeline: false
+  fused_denoise: false
+  speculative_target_extend: false
+  return_timings: true
+  seed: 42
+
+spec:
+  draft_sampling: argmax
+  remasking_strategy: low_confidence_dynamic
+  confidence_threshold: 0.95
+
+method_spec:
+  ours:
+    speculative_branch: greedy_match
+    mrs_verify_order: position
+    partial_block_fill: target_argmax   # <- the only change from L0
+
+output_dir: runs/llada2_flash_fill

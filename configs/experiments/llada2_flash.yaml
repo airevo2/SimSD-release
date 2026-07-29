@@ -1,0 +1,98 @@
+# LLaDA2 real pair: mini drafts, flash verifies.
+#
+#   python main.py -e configs/experiments/llada2_flash.yaml
+#
+# This is the configuration the LLaDA2 numbers should come from — the bring-up
+# file (llada2.yaml) runs mini against itself and only proves the pipeline is
+# correct.
+#
+#   draft  LLaDA2.0-mini    16B total /  1.4B activated /  32.5 GB bf16
+#   target LLaDA2.0-flash  102.9B total /  6.1B activated / 191.6 GiB bf16
+#
+# 4.4x activated-parameter gap, and the same tokenizer on both sides (vocab
+# 157184, byte-identical tokenizer.json), so draft and target token ids compare
+# directly — no vocab mapping in the acceptance rule.
+#
+# Placement. The target does not fit on one 96 GB card, so it is sharded over
+# four with accelerate: `device_map="auto"` lays layers out sequentially and
+# hooks each one to move activations across the boundary. That is *naive* model
+# parallelism — not tensor parallelism, and not pipeline parallelism either:
+# real PP splits the batch into micro-batches so stages overlap, whereas a
+# single input here walks the layers in order with one GPU busy at a time. At
+# bs=1 there is nothing to pipeline anyway, so what the placement really costs
+# is that only TP would parallelise inside a layer. Expect the target forward to
+# be slower than a TP=4 run of the same weights; what this configuration
+# measures honestly is the acceptance rate, and throughput only relative to a
+# baseline placed the same way. `target_gpus` are LOCAL indices, i.e. positions within `runtime.gpus`
+# after CUDA_VISIBLE_DEVICES is applied — here gpus "0,1,2,3,4" means local 0 is
+# the draft's card and local 1-4 hold the target.
+#
+# Still eager, and for the same reason as the bring-up file:
+# LLaDA2MoeSparseMoeBlock.moe_infer does tokens_per_expert.cpu().numpy() and
+# loops over 256 experts in Python, so nothing here can be captured into a
+# cuda_graph. Sharding rules it out a second time over — capture cannot span
+# accelerate's cross-device copies. main.py forces the flag off and says so.
+
+name: llada2-mini-draft-flash-target
+family: llada2
+
+models:
+  target: inclusionAI/LLaDA2.0-flash
+  draft: inclusionAI/LLaDA2.0-mini
+
+tokens:
+  mask_token_id: 156895
+
+block:
+  block_length: 32
+  denoising_steps: 32
+
+data:
+  datasets: [gsm8k]
+  num_samples: 50
+
+# `native_sharded` is the placement-matched reference: same target, same four
+# cards, same denoise schedule, no draft and no acceptance rule. Without it the
+# `ours` throughput number has nothing to divide by — and the usual TP=2
+# baselines cannot hold flash (95.8 GiB/rank against 95.6 GiB usable).
+methods: [native_sharded, ours]
+modes: [quality]
+
+mode_settings:
+  quality:
+    num_blocks: 8       # 8 x 32 = 256 token budget, EOS stop on
+
+runtime:
+  gpus: "0,1,2,3,4"
+  draft_device: cuda:0
+  target_gpus: [1, 2, 3, 4]
+  target_max_memory: 88GiB
+  use_cuda_graph: false
+  pipeline: false
+  fused_denoise: false
+  speculative_target_extend: false
+  return_timings: true
+  seed: 42
+
+# L0 — the reference point for the lever sweep. See llada2_flash_fill.yaml
+# (lever 2) and llada2_flash_draft.yaml (levers 1+2).
+#
+# Note where confidence_threshold lands. In the `ours` path it only ever
+# reaches the DRAFT: target verify is a single forward and does no denoising.
+# It is in the shared `spec:` block here because L0 deliberately gives draft and
+# baseline the same schedule; the sweep moves it into method_spec.ours.
+spec:
+  draft_sampling: argmax
+  remasking_strategy: low_confidence_dynamic
+  confidence_threshold: 0.95
+
+method_spec:
+  ours:
+    speculative_branch: greedy_match
+    mrs_verify_order: position
+    # Drops everything after the rejection point. Costs ~1/3 of the tokens per
+    # block at alpha 0.74 — llada2_flash_fill.yaml is the same run with the
+    # tail filled from target probabilities we already hold.
+    partial_block_fill: truncate
+
+output_dir: runs/llada2_flash

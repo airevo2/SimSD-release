@@ -1,0 +1,78 @@
+# LLaDA2 · quality — the arm to cite pass@1 from.
+#
+#   python run_protocol.py llada2_quality --arm both
+#
+# EOS on, so answers end naturally; the budget is OpenCompass's per-dataset
+# max_out_len (gsm8k/mbpp 512, triviaqa 64, mmlu-5shot 256). Every block_length
+# therefore gets the SAME token budget and differs only in iteration count.
+#
+# Three protocol invariants, each of which we got wrong once:
+#   * prompts: opencompass — the repo's hand-written 0-shot scores 0.78 on gsm8k,
+#     the OC template 0.925 (the paper reports 0.922).
+#   * shuffle_seed: 42 — MMLU test is sorted by subject, so the first N rows are
+#     the two narrowest subjects out of 57. Same for mbpp and triviaqa.
+#   * mmlu_style: 5shot — answer directly. Under 0-shot CoT the iteration budget
+#     becomes a hidden quality variable; MMLU drops 12-19pp as an artifact.
+#
+# cuda_graph is resolved per role (no_cuda_graph is deliberately absent): the
+# single-GPU draft is captured, the sharded target falls back to eager. Both arms
+# therefore run an identical target implementation.
+#
+# Do NOT compare wall-clock across arms here — the arms generate different
+# lengths (target 226 tok/sample vs ours 204). Throughput lives in
+# llada2_latency.yaml.
+
+name: llada2_quality
+family: llada2
+mode: quality
+
+models:
+  target: inclusionAI/LLaDA2.0-flash      # 102.9B total / 6.1B active / 191.6 GiB bf16
+  draft: inclusionAI/LLaDA2.0-mini        #  16.3B total / 1.4B active /  30.3 GiB bf16
+
+# Both arms get 5 GPUs so hardware budget is matched. The 5th card is worth only
+# +0.3% to naive model parallelism (130.67 -> 130.31 ms per forward); it is there
+# to remove "who used how many cards" as a question.
+runner: main_table/run_paper_protocol.py
+target_max_memory: 88GiB
+default_arms: [target, ours]
+
+# Block lengths that were actually swept; --bl picks one. LLaDA2 uses one model
+# pair for all of them (unlike SDAR, which needs a different checkpoint per bl).
+bl_choices: [4, 8, 16, 32]
+
+arms:
+  ours:
+    method: simsd_dual
+    needs_draft: true
+    draft_device: cuda:0
+    target_gpus: [1, 2, 3, 4]
+  target:
+    method: native_single
+    target_gpus: [0, 1, 2, 3, 4]
+
+args:
+  mask_token_id: 156895
+  dtype: bfloat16
+  seed: 42
+
+  block_length: 16
+  denoising_steps: 16
+  remasking_strategy: low_confidence_static
+  draft_sampling: argmax
+  speculative_branch: greedy_match
+  partial_block_fill: truncate
+
+  prompts: opencompass
+  shuffle_seed: 42
+  mmlu_style: 5shot
+
+  gen_length: 0
+  num_samples: 200
+  n_warmup: 3
+  kv_cache_max_len: 0
+  datasets: [gsm8k, mbpp, triviaqa, mmlu]
+
+  fused_moe: true
+
+output_dir: runs/protocol/llada2_quality
